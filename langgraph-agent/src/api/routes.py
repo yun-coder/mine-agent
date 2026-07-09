@@ -8,7 +8,6 @@ import uuid
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.security import HTTPBearer
 from opentelemetry import trace
 from pydantic import BaseModel, Field, field_validator
 

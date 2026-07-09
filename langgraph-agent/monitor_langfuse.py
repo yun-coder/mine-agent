@@ -4,10 +4,9 @@
     python monitor_langfuse.py
 """
 
-import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 
 class Colors:

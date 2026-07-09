@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 import asyncio
 from collections import defaultdict
-from typing import Optional
 
 
 class RateLimiter:
@@ -79,7 +78,7 @@ _DEFAULT_RULES: dict[str, tuple[int, int]] = {
 async def check_rate_limit(
     path: str,
     key: str = "anonymous",
-    rules: Optional[dict[str, tuple[int, int]]] = None,
+    rules: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[bool, int, int]:
     """检查速率限制 / Check rate limit.
 

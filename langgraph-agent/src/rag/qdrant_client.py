@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import httpx
 import time
-from typing import Optional
 from loguru import logger
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -30,7 +29,7 @@ from src.api.retry import retry
 # httpx 连接池单例 / httpx connection pool singleton
 # ======================================================================
 
-_embedder_client: Optional[httpx.Client] = None
+_embedder_client: httpx.Client | None = None
 
 
 def _get_embedder_client() -> httpx.Client:
@@ -64,7 +63,7 @@ class _EmbedCache:
         self._ttl = ttl_seconds
         self._cache: dict[str, tuple[float, list[float]]] = {}  # hash -> (timestamp, vector)
 
-    def get(self, text: str) -> Optional[list[float]]:
+    def get(self, text: str) -> list[float] | None:
         h = self._hash(text)
         if h in self._cache:
             ts, vec = self._cache[h]
@@ -113,7 +112,7 @@ class OllamaEmbedder:
             return []
 
         # 先尝试从缓存获取 / Try cache first
-        cached: dict[int, Optional[list[float]]] = {}
+        cached: dict[int, list[float] | None] = {}
         uncached_indices: list[int] = []
         for i, t in enumerate(texts):
             result = _embed_cache.get(t)

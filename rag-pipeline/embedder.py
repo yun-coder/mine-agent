@@ -1,6 +1,5 @@
 """Embedding 客户端: 优先使用 Ollama /api/embed 批量接口, 降级到逐条 /api/embeddings"""
 import httpx
-import numpy as np
 from typing import List
 from loguru import logger
 

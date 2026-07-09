@@ -6,7 +6,6 @@ Validates reachability of all downstream services before the app starts.
 
 from __future__ import annotations
 
-import os
 from loguru import logger
 
 

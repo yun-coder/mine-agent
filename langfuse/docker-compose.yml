@@ -1,10 +1,10 @@
-﻿# Langfuse v3 鑷墭绠?- 鍏ㄦ爤鐩戞帶
-# 鏋舵瀯: PostgreSQL + ClickHouse + Redis + MinIO + Langfuse Web/Worker
+﻿# Langfuse v3 自托管 - 全栈监控
+# 架构: PostgreSQL + ClickHouse + Redis + MinIO + Langfuse Web/Worker
 
 x-environment: &langfuse-env
   # Database
   DATABASE_URL: postgresql://langfuse:${LANGFUSE_PG_PW:-langfuse_pw}@postgres:5432/langfuse
-  # ClickHouse(鍒嗘瀽/trace 瀛樺偍)
+  # ClickHouse(分析/trace 存储)
   CLICKHOUSE_URL: http://clickhouse:8123
   CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
   CLICKHOUSE_USER: langfuse
@@ -12,12 +12,12 @@ x-environment: &langfuse-env
   CLICKHOUSE_DATABASE: langfuse
   CLICKHOUSE_DB: langfuse
   CLICKHOUSE_CLUSTER_ENABLED: "false"
-  # Redis 闃熷垪 (v3+ env: REDIS_CONNECTION_STRING, REDIS_URL 宸茶蹇借)
+  # Redis 队列 (v3+ env: REDIS_CONNECTION_STRING, REDIS_URL 已被忽略)
   REDIS_CONNECTION_STRING: redis://redis:6379
-  # S3/MinIO(blob 瀛樺偍,events)
+  # S3/MinIO(blob 存储,events)
   S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: ${LANGFUSE_MINIO_USER:-langfuse_minio}
-      S3_SECRET_KEY: ${LANGFUSE_MINIO_PW:-langfuse_minio_pw}
+  S3_ACCESS_KEY: ${LANGFUSE_MINIO_USER:-langfuse_minio}
+  S3_SECRET_KEY: ${LANGFUSE_MINIO_PW:-langfuse_minio_pw}
   S3_BUCKET: langfuse
   S3_REGION: us-east-1
   S3_FORCE_PATH_STYLE: "true"
@@ -31,9 +31,9 @@ x-environment: &langfuse-env
   NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-change-me-in-production}
   SALT: ${LANGFUSE_SALT:-generate-a-random-salt-here}
   NEXTAUTH_URL: http://127.0.0.1:3001
-  # 鍏綉 host(璁?web 鎷煎嚭姝ｇ‘鍥炶皟)
+  # 公网 host(让 web 拼出正确回调)
   HOSTNAME: 0.0.0.0
-  # telemetry 鍏抽棴
+  # telemetry 关闭
   TELEMETRY_ENABLED: "false"
 
 services:

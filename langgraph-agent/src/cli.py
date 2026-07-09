@@ -16,9 +16,8 @@ ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.agent.graph import run_agent, intent_router, AgentState
+from src.agent.graph import run_agent
 from src.config import settings
-from langchain_core.messages import HumanMessage
 
 
 def cmd_ask(args):
