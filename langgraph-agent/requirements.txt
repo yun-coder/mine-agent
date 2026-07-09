@@ -18,3 +18,4 @@ langchain-community>=0.3.0
 opentelemetry-instrumentation-langchain>=0.43.0
 psycopg2-binary>=2.9.0
 prometheus-client>=0.21.0
+sentence-transformers>=3.0.0

@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import psutil
 from langchain_core.tools import tool
 from loguru import logger
@@ -30,7 +31,92 @@ from src.agent.toolkit.sanitizer import terminal_sanitizer
 # ------------------------------------------------------------------
 
 
-def _exec_rag_query(query: str, top_k: int = 10) -> str:
+def _call_llm(prompt: str, temperature: float = 0.3, max_tokens: int = 300) -> str:
+    """调用 Ollama 生成辅助说明（非工具调用）。"""
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={
+                    "model": settings.llm_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens,
+                    },
+                },
+            )
+            r.raise_for_status()
+            return r.json()["response"].strip()
+    except Exception as exc:
+        logger.debug(f"[RAG] LLM 辅助调用失败 / LLM helper call failed: {exc}")
+        return ""
+
+
+def _rewrite_query(query: str, num_queries: int = 3) -> list[str]:
+    """LLM 改写查询为多个子查询，提升召回率。失败时降级返回原查询。"""
+    prompt = (
+        f"将以下问题改写为{num_queries}个更利于知识库检索的查询。\n"
+        "要求：\n"
+        "1. 每个查询简洁明确，不超过 30 字\n"
+        "2. 只返回 JSON 数组格式，不要其他内容\n"
+        "3. 覆盖原问题的不同角度\n\n"
+        f"原问题: {query}\n\n"
+        '输出格式示例: ["查询1", "查询2", "查询3"]'
+    )
+    response = _call_llm(prompt, temperature=0.3, max_tokens=300)
+    if not response:
+        return [query]
+
+    # 从响应中提取 JSON 数组
+    try:
+        queries = json.loads(response)
+    except json.JSONDecodeError:
+        start = response.find("[")
+        end = response.rfind("]") + 1
+        if start >= 0 and end > start:
+            try:
+                queries = json.loads(response[start:end])
+            except (json.JSONDecodeError, ValueError):
+                queries = None
+        else:
+            queries = None
+
+    if isinstance(queries, list) and all(isinstance(q, str) for q in queries) and len(queries) > 1:
+        # 去重 + 确保原查询在结果中
+        seen = set()
+        results = [query]
+        for q in queries:
+            if q not in seen and q != query:
+                seen.add(q)
+                results.append(q)
+        return results[:num_queries]
+    return [query]
+
+
+def _check_result_quality(query: str, results: list[dict]) -> tuple[bool, str | None]:
+    """检查检索结果质量。如果结果不足，返回 (False, rewritten_query)；否则返回 (True, None)。"""
+    if not results:
+        return False, query  # 无结果，重试
+
+    # 简单启发式：分数过低说明不相关
+    avg_score = sum(r.get("score", 0) for r in results) / len(results)
+    if avg_score < 0.3:
+        # 尝试用关键词风格改写查询再搜
+        rewritten = _rewrite_query(query, num_queries=2)
+        if len(rewritten) > 1:
+            return False, rewritten[1]  # 用第二个子查询重试
+        return False, query
+
+    return True, None
+
+
+def _exec_rag_query(
+    query: str,
+    top_k: int = 10,
+    rewrite_query: bool = False,
+) -> str:
     from src.rag.qdrant_client import QdrantConnector
 
     conn = QdrantConnector(
@@ -38,12 +124,46 @@ def _exec_rag_query(query: str, top_k: int = 10) -> str:
         port=settings.qdrant_port,
         collection=settings.qdrant_collection,
     )
-    results = conn.search(query, top_k=top_k)
-    if not results:
+
+    # Phase 2: 可选的多查询改写 / Optional query rewriting
+    queries = [query]
+    if rewrite_query or settings.rag_use_query_rewrite:
+        rewritten = _rewrite_query(query)
+        if rewritten:
+            queries = rewritten
+            logger.debug(f"[RAG] 查询改写 / query rewritten: {query} → {queries}")
+
+    # 多查询检索 + 去重 / Multi-query retrieval + dedup
+    seen_ids: set[str] = set()
+    all_results: list[dict] = []
+    for sq in queries:
+        results = conn.search(sq, top_k=top_k)
+        for r in results:
+            rid = r.get("id", "")
+            if rid and rid not in seen_ids:
+                seen_ids.add(rid)
+                all_results.append(r)
+        if len(all_results) >= top_k:
+            break
+
+    # 结果不足时尝试重写再检索一次 / Fallback: rewrite and retry if results are thin
+    if len(all_results) < 3 and not rewrite_query and not settings.rag_use_query_rewrite:
+        quality_ok, rewritten = _check_result_quality(query, all_results)
+        if not quality_ok and rewritten and rewritten != query:
+            logger.debug(f"[RAG] 质量不足，改写重试 / quality low, retry with: {rewritten}")
+            retry_results = conn.search(rewritten, top_k=top_k)
+            for r in retry_results:
+                rid = r.get("id", "")
+                if rid and rid not in seen_ids:
+                    seen_ids.add(rid)
+                    all_results.append(r)
+
+    # 格式化输出 / Format output
+    if not all_results:
         return "知识库中未找到匹配信息。请确认文档已索引，或换一种表述。/ Knowledge base has no matching info. Please confirm documents are indexed, or rephrase."
 
     parts: list[str] = []
-    for i, r in enumerate(results, 1):
+    for i, r in enumerate(all_results[:top_k], 1):
         meta = r.get("metadata", {})
         fname = meta.get("filename", "unknown")
         page = meta.get("page", "?")
@@ -57,7 +177,7 @@ def _exec_rag_query(query: str, top_k: int = 10) -> str:
 
 
 @tool
-def rag_query(query: str, top_k: int = 10) -> str:
+def rag_query(query: str, top_k: int = 10, rewrite_query: bool = False) -> str:
     """搜索知识库（Qdrant 向量检索 + BM25 混合检索）。用于回答基于已有文档、笔记、知识库的事实性问题。
     Search the knowledge base (Qdrant + BM25 hybrid retrieval).
     Use for factual questions about company documents, policies, procedures, notes, or any stored knowledge.
@@ -65,8 +185,9 @@ def rag_query(query: str, top_k: int = 10) -> str:
     Args:
         query: The question or search query.
         top_k: Number of results to return (default 10).
+        rewrite_query: Whether to expand the query into sub-queries for better recall (default False).
     """
-    return _exec_rag_query(query, top_k)
+    return _exec_rag_query(query, top_k, rewrite_query)
 
 
 # ------------------------------------------------------------------

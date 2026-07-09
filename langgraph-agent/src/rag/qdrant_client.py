@@ -2,13 +2,24 @@
 
 Reuses the embedding approach from rag-pipeline (Ollama /api/embed),
 but is self-contained — does not depend on rag-pipeline any modules.
+
+Added Phase 2:
+  - BM25 index (rank_bm25) for hybrid vector + keyword retrieval
+  - RRF fusion of vector & BM25 results
+  - search_hybrid() method as the new default
 """
 
 from __future__ import annotations
 
 import hashlib
-import httpx
+import json
+import pickle
+import re
 import time
+from pathlib import Path
+from typing import Any
+
+import httpx
 from loguru import logger
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -20,6 +31,7 @@ from qdrant_client.models import (
     PointStruct,
     VectorParams,
 )
+from rank_bm25 import BM25Okapi
 
 from src.config import settings
 from src.api.retry import retry
@@ -87,6 +99,33 @@ class _EmbedCache:
 
 # 全局嵌入缓存 / Global embedding cache
 _embed_cache = _EmbedCache()
+
+
+# ======================================================================
+# BM25 工具函数 / BM25 helpers
+# ======================================================================
+
+BM25_VERSION = 1
+
+
+def _tokenize(text: str) -> list[str]:
+    """中英文混合分词：中文按字 + 英文按词，降为小写。"""
+    text = text.lower()
+    en_words = re.findall(r"[a-z0-9]+", text)
+    cn_chars = re.findall(r"[一-鿿]", text)
+    return en_words + cn_chars
+
+
+def rrf_fuse(*ranked_lists: list[tuple[str, float]], k: int = 60) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion: 多路排序融合。
+    输入：每个 ranked_list 是 [(doc_id, score)] 列表
+    输出：[(doc_id, fused_score)] 按融合分数降序。
+    """
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, (doc_id, _) in enumerate(ranked, 1):
+            scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
 # ======================================================================
@@ -184,7 +223,11 @@ class OllamaEmbedder:
 # ======================================================================
 
 class QdrantConnector:
-    """智能体 RAG 检索的 Qdrant 薄封装 / Thin wrapper around Qdrant for the Agent's RAG retrieval."""
+    """智能体 RAG 检索的 Qdrant 薄封装 / Thin wrapper around Qdrant for the Agent's RAG retrieval.
+
+    Phase 2 enhancement: supports hybrid search (vector + BM25 + RRF fusion)
+    and optional reranking.
+    """
 
     def __init__(
         self,
@@ -197,7 +240,153 @@ class QdrantConnector:
         self.collection = collection or settings.qdrant_collection
         self.client = QdrantClient(host=self.host, port=self.port, timeout=60)
         self.embedder = OllamaEmbedder(base_url=settings.ollama_base_url)
+
+        # BM25 索引（惰性加载）
+        self._bm25: BM25Okapi | None = None
+        self._bm25_chunk_ids: list[str] = []
+        self._bm25_texts: list[str] = []
+        self._bm25_metadatas: list[dict] = []
+        self._bm25_path = self._resolve_bm25_path()
+
+        # Reranker（惰性加载）
+        self._reranker: Any | None = None
+
         logger.info(f"[Qdrant] {self.host}:{self.port} collection={self.collection}")
+
+    def _resolve_bm25_path(self) -> Path:
+        if settings.rag_bm25_path:
+            return Path(settings.rag_bm25_path)
+        # 自动选择：优先用项目根下的 data/bm25，然后是 rag-pipeline 的缓存
+        candidates = [
+            settings.project_root / "data" / "qdrant" / f"{self.collection}.bm25.pkl",
+            Path(f"/data/qdrant/{self.collection}.bm25.pkl"),
+        ]
+        for c in candidates:
+            if c.parent.exists():
+                return c
+        return candidates[0]
+
+    # ------------------------------------------------------------------
+    # BM25 索引构建与持久化 / BM25 index lifecycle
+    # ------------------------------------------------------------------
+
+    def _ensure_bm25(self) -> None:
+        """确保 BM25 索引已加载/构建。"""
+        if self._bm25 is not None:
+            return
+        if self._load_bm25():
+            return
+        self._build_bm25()
+
+    def _load_bm25(self) -> bool:
+        """从 pickle 缓存加载 BM25 索引。"""
+        path = self._bm25_path.with_suffix(".meta.pkl") if self._bm25_path.suffix == ".pkl" else self._bm25_path
+        bm25_path = self._bm25_path
+        if not bm25_path.exists():
+            return False
+        try:
+            with open(bm25_path, "rb") as f:
+                data = pickle.load(f)
+            if data.get("version") != BM25_VERSION:
+                logger.warning("[BM25] 版本不匹配，忽略缓存 / version mismatch, ignoring cache")
+                return False
+            self._bm25_chunk_ids = data["chunk_ids"]
+            self._bm25_texts = data["texts"]
+            self._bm25_metadatas = data["metadatas"]
+            # BM25Okapi 对象需单独反序列化
+            tokenized_corpus = [_tokenize(t) for t in self._bm25_texts]
+            self._bm25 = BM25Okapi(tokenized_corpus)
+            logger.info(f"[BM25] 从缓存加载 / loaded: {len(self._bm25_chunk_ids)} docs")
+            return True
+        except Exception as exc:
+            logger.warning(f"[BM25] 加载缓存失败 ({exc})，重新构建 / load failed, rebuilding")
+            return False
+
+    def _build_bm25(self) -> None:
+        """从 Qdrant 集合中 scroll 所有数据构建 BM25 索引。"""
+        logger.info("[BM25] 从 Qdrant 构建索引 / building from Qdrant...")
+        self.ensure_collection()
+        offset = None
+        all_chunks: list[dict] = []
+        while True:
+            results, offset = self.client.scroll(
+                collection_name=self.collection,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for r in results:
+                payload = r.payload
+                all_chunks.append({
+                    "chunk_id": payload.get("chunk_id", str(r.id)),
+                    "text": payload.get("text", ""),
+                    "metadata": {k: v for k, v in payload.items() if k != "text"},
+                })
+            if offset is None:
+                break
+        if not all_chunks:
+            logger.warning("[BM25] 集合为空，跳过索引构建 / collection empty, skipping")
+            return
+
+        self._bm25_chunk_ids = [c["chunk_id"] for c in all_chunks]
+        self._bm25_texts = [c["text"] for c in all_chunks]
+        self._bm25_metadatas = [c["metadata"] for c in all_chunks]
+        tokenized_corpus = [_tokenize(t) for t in self._bm25_texts]
+        self._bm25 = BM25Okapi(tokenized_corpus)
+
+        # 持久化到磁盘
+        try:
+            self._bm25_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._bm25_path, "wb") as f:
+                pickle.dump({
+                    "version": BM25_VERSION,
+                    "chunk_ids": self._bm25_chunk_ids,
+                    "texts": self._bm25_texts,
+                    "metadatas": self._bm25_metadatas,
+                }, f)
+            logger.info(f"[BM25] 已持久化 / saved: {len(all_chunks)} docs → {self._bm25_path}")
+        except Exception as exc:
+            logger.warning(f"[BM25] 持久化失败 / save failed: {exc}")
+
+    def _bm25_search(self, query: str, top_k: int = 20) -> list[tuple[str, float]]:
+        """BM25 检索，返回 [(chunk_id, score)]。"""
+        self._ensure_bm25()
+        if self._bm25 is None:
+            return []
+        tokenized_query = _tokenize(query)
+        scores = self._bm25.get_scores(tokenized_query)
+        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+        return [(self._bm25_chunk_ids[idx], float(score)) for idx, score in ranked if score > 0]
+
+    def rebuild_bm25(self) -> None:
+        """强制重新构建 BM25 索引（清除缓存）。"""
+        self._bm25 = None
+        self._bm25_chunk_ids = []
+        self._bm25_texts = []
+        self._bm25_metadatas = []
+        # 删除缓存文件
+        if self._bm25_path.exists():
+            self._bm25_path.unlink(missing_ok=True)
+        self._build_bm25()
+
+    # ------------------------------------------------------------------
+    # Reranker 惰性加载 / Reranker lazy loading
+    # ------------------------------------------------------------------
+
+    def _ensure_reranker(self) -> None:
+        """惰性加载 Reranker。"""
+        if self._reranker is not None:
+            return
+        try:
+            from sentence_transformers import CrossEncoder
+            logger.info("[Reranker] 加载 / loading BGE-Reranker-v2-m3...")
+            self._reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
+            logger.info("[Reranker] 就绪 / ready")
+        except ImportError:
+            logger.warning("[Reranker] sentence-transformers 未安装，跳过 / not installed, skipping")
+        except Exception as exc:
+            logger.warning(f"[Reranker] 加载失败 / load failed: {exc}")
 
     # ------------------------------------------------------------------
     # 集合管理 / Collection management
@@ -264,7 +453,26 @@ class QdrantConnector:
         filter_acl: list[str] | None = None,
         filter_dept: list[str] | None = None,
     ) -> list[dict]:
-        """语义搜索，支持 ACL 和部门过滤。/ Semantic search with optional ACL and department filters."""
+        """语义搜索，支持 ACL 和部门过滤。
+        如果 settings.rag_use_hybrid_search 开启，自动使用向量+BM25+RRF 混合检索。
+        """
+        if settings.rag_use_hybrid_search:
+            return self.search_hybrid(
+                query=query,
+                top_k=top_k or settings.top_k_rag,
+                filter_acl=filter_acl,
+                filter_dept=filter_dept,
+            )
+        return self._search_vector_only(query, top_k, filter_acl, filter_dept)
+
+    def _search_vector_only(
+        self,
+        query: str,
+        top_k: int | None = None,
+        filter_acl: list[str] | None = None,
+        filter_dept: list[str] | None = None,
+    ) -> list[dict]:
+        """纯向量语义搜索（旧逻辑）。"""
         top_k = top_k or settings.top_k_rag
         vec = self.embedder.embed_one(query)
 
@@ -295,6 +503,88 @@ class QdrantConnector:
             }
             for r in results
         ]
+
+    def search_hybrid(
+        self,
+        query: str,
+        top_k: int | None = None,
+        top_k_vector: int = 20,
+        top_k_bm25: int = 20,
+        top_k_rrf: int = 10,
+        top_k_rerank: int = 5,
+        filter_acl: list[str] | None = None,
+        filter_dept: list[str] | None = None,
+        use_reranker: bool = False,
+    ) -> list[dict]:
+        """混合检索：向量 + BM25 + RRF 融合 + 可选重排序。"""
+        top_k = top_k or settings.top_k_rag
+        top_k_vector = min(top_k_vector, top_k * 2)
+        top_k_bm25 = min(top_k_bm25, top_k * 2)
+        top_k_rrf = top_k
+        top_k_rerank = min(top_k_rerank, top_k)
+
+        # 1) 向量检索
+        vec_results = self._search_vector_only(query, top_k=top_k_vector, filter_acl=filter_acl, filter_dept=filter_dept)
+        vec_ranked = [(r["id"], r["score"]) for r in vec_results]
+
+        # 2) BM25 检索
+        bm25_ranked = self._bm25_search(query, top_k=top_k_bm25)
+
+        # 3) RRF 融合
+        if bm25_ranked:
+            fused = rrf_fuse(vec_ranked, bm25_ranked, k=settings.rag_rrf_k)[:top_k_rrf]
+        else:
+            fused = vec_ranked[:top_k_rrf]
+
+        # 构建 id → result 映射（优先用向量结果的 payload，因为含完整 metadata）
+        id_to_result: dict[str, dict] = {}
+        for r in vec_results:
+            id_to_result[r["id"]] = r
+        # 补充 BM25 独有的结果（metadata 为空时从 BM25 索引补）
+        if self._bm25_chunk_ids:
+            for cid, _ in fused:
+                if cid not in id_to_result and cid in self._bm25_chunk_ids:
+                    idx = self._bm25_chunk_ids.index(cid)
+                    id_to_result[cid] = {
+                        "id": cid,
+                        "score": 0.0,
+                        "text": self._bm25_texts[idx],
+                        "metadata": self._bm25_metadatas[idx],
+                    }
+
+        # 4) 可选重排序
+        if use_reranker or settings.rag_use_reranker:
+            self._ensure_reranker()
+            if self._reranker is not None:
+                rerank_input = []
+                rerank_ids = []
+                for doc_id, _ in fused:
+                    r = id_to_result.get(doc_id)
+                    if r and r.get("text"):
+                        rerank_input.append(r["text"])
+                        rerank_ids.append(doc_id)
+                if rerank_input:
+                    scores = self._reranker.predict(
+                        [[query, d] for d in rerank_input],
+                        show_progress_bar=False,
+                    )
+                    ranked = sorted(
+                        enumerate(scores), key=lambda x: x[1], reverse=True
+                    )[:top_k_rerank]
+                    fused = [
+                        (rerank_ids[idx], float(s))
+                        for idx, s in ranked
+                    ]
+
+        # 5) 组装最终结果
+        final: list[dict] = []
+        for doc_id, score in fused:
+            r = id_to_result.get(doc_id)
+            if r:
+                final.append({**r, "score": score})
+            if len(final) >= top_k:
+                break
+        return final
 
     # ------------------------------------------------------------------
     # 元数据辅助方法 / Metadata helpers

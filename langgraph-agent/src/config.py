@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     top_k_rag: int = 10
     stream_chunk_size: int = 4
 
+    # RAG 检索增强 / RAG retrieval enhancement
+    rag_use_hybrid_search: bool = True   # 开启向量+BM25+RRF混合检索
+    rag_use_reranker: bool = False       # 开启BGE Reranker重排序
+    rag_use_query_rewrite: bool = False  # 开启LLM查询改写
+    rag_rerank_top_k: int = 5            # 重排序后保留的结果数
+    rag_rrf_k: int = 60                  # RRF融合参数
+    rag_bm25_path: str = ""              # BM25索引缓存路径(空=自动)
+
     # Langfuse 配置 / Langfuse
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
