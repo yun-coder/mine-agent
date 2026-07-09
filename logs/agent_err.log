@@ -1,0 +1,5 @@
+2026-07-08 16:47:01.273 | INFO     | src.agent.graph:_init_langfuse:71 - [Langfuse] ÒÑÁ¬½Ó http://127.0.0.1:3001
+INFO:     Started server process [36812]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
