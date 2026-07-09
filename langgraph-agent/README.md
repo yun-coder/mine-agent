@@ -19,16 +19,21 @@ FastAPI Server (:8000)
   └─ /health               — 健康检查 / Health check
   │
   ▼
-LangGraph StateGraph (Hybrid)
-  intent_router ──▶ rag_fetch ──┐
-          │              code_search ──┐
-          └── tool/general ────────────┤
-                                       ▼
-                            create_react_agent (subgraph)
-                                       │
-                              intent-filtered tools
-                                       ▼
-                              format_response
+LangGraph StateGraph (Agentic RAG)
+  create_react_agent (subgraph)
+      │
+      Agent 拥有全部工具，自主决策何时/是否调用：
+      ├─ rag_query          — 搜索知识库 (Qdrant + BM25)
+      ├─ code_search        — 搜索代码
+      ├─ code_read          — 读取代码文件
+      ├─ terminal_execute   — 执行命令（沙箱保护）
+      ├─ system_info        — 系统信息
+      ├─ calculate          — 数学计算
+      ├─ file_tree          — 目录浏览
+      └─ get_current_time   — 时间
+      │
+      ▼
+  format_response
   │
   ▼
 Qdrant (:6333) ←→ Ollama (:11434) ←→ Langfuse (:3001)
@@ -38,7 +43,7 @@ Qdrant (:6333) ←→ Ollama (:11434) ←→ Langfuse (:3001)
 
 | Feature / 功能 | Description / 说明 |
 |---|---|
-| **意图路由** / Intent Routing | 启发式关键词分类：rag / code / tool / general |
+| **意图路由** / Intent Routing | 已移除 — Agentic RAG 模式下由 Agent 自主决策 |
 | **企业 RAG** / Enterprise RAG | Qdrant 语义检索 + Ollama 嵌入，支持 ACL/部门过滤 |
 | **代码助手** / Code Assistant | 代码搜索、文件读取、目录浏览 |
 | **沙箱终端** / Sandboxed Terminal | 三层防御（黑名单 + 白名单 + 执行隔离） |
@@ -86,7 +91,6 @@ DOCS_DIR=F:/data/docs
 # Agent settings
 MAX_ITERATIONS=5
 TOP_K_RAG=10
-TOP_K_CODE=20
 STREAM_CHUNK_SIZE=4
 
 # Langfuse (optional)
@@ -194,7 +198,7 @@ def my_tool(param: str) -> str:
 AGENT_TOOLS = [..., my_tool]
 ```
 
-`TOOL_DEFINITIONS` 会自动从 `@tool` 实例生成，无需手动维护。
+`AGENT_TOOLS` 列表中的工具会自动注册给 create_react_agent。
 
 ## Checkpointing / 持久化检查点
 

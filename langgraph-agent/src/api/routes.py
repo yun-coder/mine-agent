@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from opentelemetry import trace
 from pydantic import BaseModel, Field, field_validator
 
-from src.agent.graph import run_agent, get_compiled_graph, intent_router, AgentState
+from src.agent.graph import run_agent, get_compiled_graph, AgentState
 from src.config import settings
 from src.api.auth import api_key_auth
 from src.api.rate_limit import check_rate_limit
@@ -52,8 +52,6 @@ class HealthResponse(BaseModel):
 class AgentResponse(BaseModel):
     answer: str
     tool_log: list[dict]
-    intent: str
-    sources: list[str]
     session_id: str
     elapsed_ms: int
 
@@ -175,8 +173,6 @@ async def agent_ask(req: QuestionRequest, request: Request):
     return AgentResponse(
         answer=result.get("final_answer", result.get("answer", "")),
         tool_log=result.get("tool_log", []),
-        intent=result.get("intent", ""),
-        sources=result.get("sources", []),
         session_id=req.session_id,
         elapsed_ms=elapsed,
     )
@@ -210,41 +206,23 @@ async def agent_stream(req: QuestionRequest, request: Request):
             "messages": [HumanMessage(content=req.question)],
             "query": req.question,
             "session_id": req.session_id,
-            "intent_category": "",
-            "intent_confidence": 0.0,
-            "retriever_context": "",
-            "retriever_sources": [],
-            "retriever_scores": [],
-            "code_results": [],
-            "pending_tool_calls": [],
-            "tool_results": [],
             "final_answer": "",
             "tool_log": [],
-            "error": "",
             "iteration_count": 0,
         }
-
-        # 先做意图分类
-        routed = intent_router(initial)
-        intent = routed.get("intent_category", "general")
-        yield f"data: {json.dumps({'type': 'intent', 'category': intent}, ensure_ascii=False)}\n\n"
 
         # 编译图
         graph = get_compiled_graph(checkpoint=False)
 
-        # 使用 LangGraph 原生 astream_events (stream_mode="messages_tuple")
-        # Langfuse 4.x 通过 OTel 自动捕获，无需 callbacks
         try:
             async for event_type, event_data in graph.astream_events(
                 initial, version="v2"
             ):
-                # 只关注 LLM 生成的 token
                 if event_type == "on_chat_model_stream":
                     content = event_data.get("data", {}).get("content", "")
                     if content:
                         yield f"data: {json.dumps({'type': 'token', 'data': content}, ensure_ascii=False)}\n\n"
 
-                # 工具调用事件
                 elif event_type == "on_tool_start":
                     tool_name = event_data.get("name", "unknown")
                     yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name}, ensure_ascii=False)}\n\n"
@@ -257,25 +235,20 @@ async def agent_stream(req: QuestionRequest, request: Request):
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
             return
 
-        # 获取最终结果 — 从 astream_events 的最后一个 AIMessage 提取，不再重复调用 graph.invoke()
-        # Extract final answer from last AIMessage in astream_events, no need to call graph.invoke() again
+        # 获取最终结果
         final_answer = ""
-        last_content = ""
         result: dict = {}
         try:
-            # Re-run once to get the final state (astream_events is a generator, consumed above)
             result = graph.invoke(initial)
-            last_content = result.get("final_answer", "")
-            if not last_content:
+            final_answer = result.get("final_answer", "")
+            if not final_answer:
                 for msg in reversed(result.get("messages", [])):
                     if hasattr(msg, "content") and msg.content:
-                        last_content = msg.content
+                        final_answer = msg.content
                         break
         except Exception:
-            last_content = ""
+            final_answer = ""
 
-        # 发送最终答案 / Send final answer
-        final_answer = last_content or ""
         if final_answer:
             chunk_size = settings.stream_chunk_size
             for i in range(0, len(final_answer), chunk_size):
@@ -284,8 +257,6 @@ async def agent_stream(req: QuestionRequest, request: Request):
 
         meta = {
             "type": "metadata",
-            "intent": result.get("intent_category", intent) if result else intent,
-            "sources": result.get("retriever_sources", []) if result else [],
             "tool_log": result.get("tool_log", []) if result else [],
             "elapsed_ms": int((time.time() - t0) * 1000),
         }

@@ -23,7 +23,6 @@ class Settings(BaseSettings):
     # 智能体调优参数 / Agent tuning
     max_iterations: int = 5
     top_k_rag: int = 10
-    top_k_code: int = 20
     stream_chunk_size: int = 4
 
     # Langfuse 配置 / Langfuse

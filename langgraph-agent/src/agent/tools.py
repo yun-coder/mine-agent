@@ -1,8 +1,11 @@
 """工具定义和执行器 — 基于 langchain_core.tools 的 @tool 装饰器。
 
 每个工具遵循 OpenAI 函数调用格式，可直接用于 Ollama 的工具调用 API。
-Each tool follows the OpenAI function-calling schema so it can be used
-directly with Ollama's tool-calling API.
+Agentic RAG 模式下，Agent 拥有全部工具，自主决定何时调用 rag_query。
+
+Architecture change 2026-07-09:
+  Removed TOOL_DEFINITIONS / _tool_to_dict (was for old intent-filtered routing).
+  Agent now uses AGENT_TOOLS directly via bind_tools().
 """
 
 from __future__ import annotations
@@ -55,9 +58,9 @@ def _exec_rag_query(query: str, top_k: int = 10) -> str:
 
 @tool
 def rag_query(query: str, top_k: int = 10) -> str:
-    """搜索企业知识库（Qdrant + BM25 混合检索）。用于关于公司文档、政策、流程的事实性问题。
-    Search the enterprise knowledge base (Qdrant + BM25 hybrid retrieval).
-    Use for factual questions about company documents, policies, procedures.
+    """搜索知识库（Qdrant 向量检索 + BM25 混合检索）。用于回答基于已有文档、笔记、知识库的事实性问题。
+    Search the knowledge base (Qdrant + BM25 hybrid retrieval).
+    Use for factual questions about company documents, policies, procedures, notes, or any stored knowledge.
 
     Args:
         query: The question or search query.
@@ -347,26 +350,3 @@ AGENT_TOOLS: list[Any] = [
     calculate,
     get_current_time,
 ]
-
-
-def _tool_to_dict(t: Any) -> dict[str, Any]:
-    """将 @tool 装饰的函数转换为 dict 格式（供 bind_tools 使用）。"""
-    schema = t.get_output_schema().model_json_schema()
-    props = schema.get("properties", {})
-    required = schema.get("required", [])
-    return {
-        "type": "function",
-        "function": {
-            "name": t.name,
-            "description": t.description,
-            "parameters": {
-                "type": "object",
-                "properties": props,
-                "required": required,
-            },
-        },
-    }
-
-
-# 派生 dict 格式工具定义 — 从 @tool 实例自动生成，无需手动维护
-TOOL_DEFINITIONS: list[dict[str, Any]] = [_tool_to_dict(t) for t in AGENT_TOOLS]

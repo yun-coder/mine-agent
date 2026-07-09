@@ -28,13 +28,8 @@ def cmd_ask(args):
         checkpoint=False,
     )
     print(f"\n{'='*60}")
-    print(f"意图: {result.get('intent', 'unknown')}")
-    print(f"{'='*60}")
     print(f"回答:\n{result.get('final_answer', result.get('answer', ''))}")
     print(f"\n{'='*60}")
-    sources = result.get('sources', [])
-    if sources:
-        print(f"资料来源: {', '.join(sources[:5])}")
     print(f"工具调用: {len(result.get('tool_log', []))} 步")
     print(f"{'='*60}")
 
@@ -56,10 +51,8 @@ def cmd_stream(args):
                     data = json.loads(line[6:])
                     if data.get("type") == "token":
                         print(data["data"], end="", flush=True)
-                    elif data.get("type") == "intent":
-                        print(f"\n[意图分类: {data['category']}]", flush=True)
                     elif data.get("type") == "metadata":
-                        print(f"\n[完成: {data['elapsed_ms']}ms, 意图: {data['intent']}]")
+                        print(f"\n[完成: {data['elapsed_ms']}ms]")
                         if data.get("sources"):
                             print(f"  资料来源: {', '.join(data['sources'][:5])}")
 
