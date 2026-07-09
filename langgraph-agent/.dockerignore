@@ -1,0 +1,13 @@
+# 构建时忽略 / Build-time ignore — 防止本地 venv / poetry 等被 COPY 进镜像
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.git
+.gitignore
+logs
+*.log
+tests/
+.dockerignore

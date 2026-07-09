@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>企业知识库 RAG 问答</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --panel: #10161f;
+    --panel-2: #0a0d12;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #9aa7b6;
+    --accent: #58a6ff;
+    --accent-soft: rgba(88, 166, 255, 0.14);
+    --green: #3fb950;
+    --green-soft: rgba(63, 185, 80, 0.13);
+    --orange: #d29922;
+    --orange-soft: rgba(210, 153, 34, 0.14);
+    --red: #f85149;
+    --purple: #bc8cff;
+    --purple-soft: rgba(188, 140, 255, 0.14);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, textarea { font: inherit; }
+  .app {
+    display: grid;
+    grid-template-columns: 288px minmax(0, 1fr);
+    height: 100vh;
+  }
+  .sidebar {
+    background: var(--bg-soft);
+    border-right: 1px solid var(--border);
+    padding: 20px;
+    overflow-y: auto;
+  }
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 22px;
+    font-size: 18px;
+    font-weight: 650;
+  }
+  .logo-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green);
+  }
+  .section-title {
+    margin: 20px 0 8px;
+    color: var(--text-dim);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+  }
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 0;
+    font-size: 13px;
+  }
+  .stat-row span:last-child {
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  .model-pill {
+    display: inline-block;
+    margin: 2px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 12px;
+  }
+  .examples {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .example {
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-dim);
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 180ms ease, color 180ms ease, background 180ms ease;
+  }
+  .example:hover,
+  .example:focus-visible {
+    color: var(--text);
+    background: var(--panel);
+    border-color: var(--accent);
+    outline: none;
+  }
+  .tip {
+    margin-top: 14px;
+    padding: 11px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  code {
+    color: var(--text);
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  .main {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 15px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .header-note {
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 22px 24px;
+  }
+  .msg {
+    width: min(1080px, 100%);
+    margin-bottom: 22px;
+  }
+  .msg-q,
+  .msg-a {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .avatar {
+    display: flex;
+    width: 32px;
+    height: 32px;
+    flex: 0 0 32px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    color: var(--bg);
+    font-weight: 700;
+  }
+  .msg-q .avatar { background: var(--accent); }
+  .msg-a .avatar { background: var(--green); }
+  .msg-q .body,
+  .answer-text {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-soft);
+  }
+  .msg-q .body {
+    padding: 12px 16px;
+    line-height: 1.6;
+  }
+  .msg-a .body {
+    min-width: 0;
+    flex: 1;
+    line-height: 1.7;
+  }
+  .answer-text {
+    padding: 14px 18px;
+    white-space: pre-wrap;
+  }
+  .answer-text .cite {
+    color: var(--accent);
+    font-weight: 700;
+    text-decoration: none;
+  }
+  .answer-text .cite:hover { text-decoration: underline; }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-top: 8px;
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .citations {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .citation {
+    padding: 10px 13px;
+    border: 1px solid var(--border);
+    border-left-color: var(--accent);
+    border-radius: 8px;
+    background: var(--panel-2);
+    font-size: 13px;
+    transition: background 220ms ease, border-color 220ms ease;
+  }
+  .citation-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 4px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .citation-num {
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--bg);
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+  .citation-score,
+  .citation-src {
+    color: var(--text-dim);
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 11px;
+  }
+  .citation-text {
+    color: var(--text);
+    line-height: 1.62;
+  }
+  .citation-src {
+    margin-top: 4px;
+    overflow-wrap: anywhere;
+  }
+  .empty {
+    width: min(900px, 100%);
+    padding: 72px 12px;
+    color: var(--text-dim);
+    text-align: center;
+  }
+  .empty h2 {
+    margin: 0 0 8px;
+    color: var(--text);
+    font-size: 22px;
+    font-weight: 550;
+  }
+  .visualizer {
+    margin-bottom: 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    overflow: hidden;
+  }
+  .visual-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .visual-title {
+    font-size: 13px;
+    font-weight: 650;
+  }
+  .visual-status {
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .visual-grid {
+    display: grid;
+    grid-template-columns: 1.05fr 1.1fr 1.25fr;
+    gap: 1px;
+    background: var(--border);
+  }
+  .visual-col {
+    min-width: 0;
+    padding: 13px;
+    background: var(--panel);
+  }
+  .visual-col h3 {
+    margin: 0 0 10px;
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .doc-stack {
+    display: grid;
+    gap: 8px;
+  }
+  .doc-line {
+    height: 8px;
+    border-radius: 999px;
+    background: #293445;
+  }
+  .doc-line:nth-child(2) { width: 88%; }
+  .doc-line:nth-child(3) { width: 74%; }
+  .chunk-row {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 12px;
+  }
+  .chunk {
+    min-height: 34px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-2);
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    transition: background 240ms ease, border-color 240ms ease, color 240ms ease, transform 240ms ease;
+  }
+  .step-list {
+    display: grid;
+    gap: 8px;
+  }
+  .flow-step {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text-dim);
+    font-size: 12px;
+    transition: background 220ms ease, border-color 220ms ease, color 220ms ease;
+  }
+  .step-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #4b5566;
+  }
+  .step-metric {
+    color: var(--text-dim);
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 11px;
+  }
+  .result-list {
+    display: grid;
+    gap: 7px;
+  }
+  .result-item {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) 54px;
+    gap: 8px;
+    align-items: center;
+    min-height: 34px;
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .bar {
+    height: 6px;
+    border-radius: 999px;
+    background: #293445;
+    overflow: hidden;
+  }
+  .bar span {
+    display: block;
+    width: 24%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transition: width 300ms ease;
+  }
+  .result-score {
+    color: var(--text-dim);
+    text-align: right;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 11px;
+  }
+  .visualizer[data-phase="chunk"] .chunk:nth-child(-n+3),
+  .visualizer[data-phase="embed"] .chunk:nth-child(-n+4),
+  .visualizer[data-phase="search"] .chunk:nth-child(2),
+  .visualizer[data-phase="search"] .chunk:nth-child(4),
+  .visualizer[data-phase="fuse"] .chunk:nth-child(2),
+  .visualizer[data-phase="fuse"] .chunk:nth-child(4),
+  .visualizer[data-phase="generate"] .chunk:nth-child(2) {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+    transform: translateY(-1px);
+  }
+  .flow-step.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+  .flow-step.active .step-dot {
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+  }
+  .flow-step.done {
+    border-color: rgba(63, 185, 80, 0.55);
+    background: var(--green-soft);
+    color: var(--text);
+  }
+  .flow-step.done .step-dot { background: var(--green); }
+  .flow-step.warn {
+    border-color: rgba(210, 153, 34, 0.62);
+    background: var(--orange-soft);
+  }
+  .loading-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 13px 2px 2px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .loading-dot {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: bounce 1.4s infinite ease-in-out both;
+  }
+  .loading-dot:nth-child(2) { animation-delay: -0.18s; }
+  .loading-dot:nth-child(3) { animation-delay: -0.36s; }
+  @keyframes bounce {
+    0%, 80%, 100% { transform: scale(0.35); opacity: 0.4; }
+    40% { transform: scale(1); opacity: 1; }
+  }
+  .input-bar {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-soft);
+  }
+  .input-box {
+    display: flex;
+    gap: 12px;
+    width: min(900px, 100%);
+  }
+  textarea {
+    min-height: 44px;
+    max-height: 160px;
+    flex: 1;
+    resize: none;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text);
+    padding: 12px 14px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  textarea::placeholder { color: #8793a3; }
+  .send-btn {
+    min-width: 78px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--bg);
+    padding: 0 18px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .send-btn:disabled {
+    background: var(--border);
+    color: var(--text-dim);
+    cursor: not-allowed;
+  }
+  .send-btn:hover:not(:disabled) { filter: brightness(1.05); }
+  .footer-hint {
+    width: min(900px, 100%);
+    margin-top: 8px;
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  @media (max-width: 920px) {
+    .app { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+    .visual-grid { grid-template-columns: 1fr; }
+    .header { align-items: flex-start; flex-direction: column; }
+  }
+  @media (max-width: 620px) {
+    .chat,
+    .input-bar,
+    .header { padding-left: 14px; padding-right: 14px; }
+    .input-box { align-items: stretch; flex-direction: column; }
+    .send-btn { min-height: 42px; }
+    .result-item { grid-template-columns: 30px minmax(0, 1fr); }
+    .result-score { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> 企业知识库</div>
+
+    <div class="section-title">系统状态</div>
+    <div class="stat-row"><span>Qdrant chunks</span><span id="stat-count">-</span></div>
+    <div class="stat-row"><span>LLM</span><span id="stat-llm">qwen3:8b</span></div>
+    <div class="stat-row"><span>Embedding</span><span>bge-m3</span></div>
+    <div class="stat-row"><span>检索策略</span><span>向量 + BM25 + RRF</span></div>
+    <div class="stat-row"><span>默认精排</span><span id="stat-rerank">-</span></div>
+
+    <div class="section-title">已加载模型</div>
+    <div id="model-list">
+      <span class="model-pill" style="background:var(--panel-2);color:var(--text-dim)">加载中...</span>
+    </div>
+
+    <div class="section-title">快速提问</div>
+    <div class="examples" id="examples">
+      <button class="example" data-q="公司年假有几天？">年假天数</button>
+      <button class="example" data-q="病假怎么审批？">病假流程</button>
+      <button class="example" data-q="加班费怎么算？">加班费规则</button>
+    </div>
+
+    <div class="tip">
+      文档放到 <code>F:/data/docs/</code> 后执行：<br>
+      <code>python F:/projects/rag-pipeline/ingest.py F:/data/docs</code>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="header">
+      <h1>智能问答</h1>
+      <div class="header-note">本地知识库检索，答案会附带来源 chunk</div>
+    </div>
+
+    <div class="chat" id="chat">
+      <div class="empty">
+        <h2>问一个知识库问题</h2>
+        <p>提交后可以看到文档如何切块、检索如何定位，以及答案如何从命中的数据生成。</p>
+      </div>
+    </div>
+
+    <div class="input-bar">
+      <div class="input-box">
+        <textarea id="q" placeholder="输入你的问题... Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+        <button class="send-btn" id="send" onclick="ask()">发送</button>
+      </div>
+      <div class="footer-hint">
+        当前服务依赖本机 Ollama、Qdrant 和 FastAPI。CPU 首次生成可能较慢，检索阶段通常远快于 LLM 生成阶段。
+      </div>
+    </div>
+  </main>
+</div>
+
+<template id="visual-template">
+  <div class="visualizer" data-phase="chunk">
+    <div class="visual-head">
+      <div class="visual-title">RAG 检索流程模拟</div>
+      <div class="visual-status">正在切分文档...</div>
+    </div>
+    <div class="visual-grid">
+      <section class="visual-col">
+        <h3>文档切割</h3>
+        <div class="doc-stack">
+          <div class="doc-line"></div>
+          <div class="doc-line"></div>
+          <div class="doc-line"></div>
+        </div>
+        <div class="chunk-row">
+          <div class="chunk">c0</div>
+          <div class="chunk">c1</div>
+          <div class="chunk">c2</div>
+          <div class="chunk">c3</div>
+        </div>
+      </section>
+      <section class="visual-col">
+        <h3>搜索定位</h3>
+        <div class="step-list">
+          <div class="flow-step" data-step="chunk"><span class="step-dot"></span><span>按句子累积到 512 tokens，保留 64 overlap</span><span class="step-metric">chunk</span></div>
+          <div class="flow-step" data-step="embed"><span class="step-dot"></span><span>Ollama bge-m3 生成 1024 维向量</span><span class="step-metric">embed</span></div>
+          <div class="flow-step" data-step="search"><span class="step-dot"></span><span>Qdrant 余弦相似度 + BM25 关键词召回</span><span class="step-metric">top20</span></div>
+          <div class="flow-step" data-step="fuse"><span class="step-dot"></span><span>RRF 融合排序，默认保留 top10</span><span class="step-metric">rrf</span></div>
+          <div class="flow-step" data-step="generate"><span class="step-dot"></span><span>把 top chunks 写入 prompt，Ollama 生成带引用答案</span><span class="step-metric">LLM</span></div>
+        </div>
+      </section>
+      <section class="visual-col">
+        <h3>命中数据结构</h3>
+        <div class="result-list">
+          <div class="result-item"><span>[1]</span><div class="bar"><span></span></div><span class="result-score">0.00</span></div>
+          <div class="result-item"><span>[2]</span><div class="bar"><span></span></div><span class="result-score">0.00</span></div>
+          <div class="result-item"><span>[3]</span><div class="bar"><span></span></div><span class="result-score">0.00</span></div>
+          <div class="result-item"><span>meta</span><div class="bar"><span style="width:64%;background:var(--purple)"></span></div><span class="result-score">payload</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</template>
+
+<script>
+  const chat = document.getElementById('chat');
+  const qInput = document.getElementById('q');
+  const sendBtn = document.getElementById('send');
+  const phases = [
+    ['chunk', '正在按句子切分文档...'],
+    ['embed', '正在把问题编码为向量...'],
+    ['search', '正在同时做向量检索和 BM25 召回...'],
+    ['fuse', '正在用 RRF 融合候选结果...'],
+    ['generate', '正在组织上下文并生成答案...']
+  ];
+
+  qInput.addEventListener('input', () => {
+    qInput.style.height = 'auto';
+    qInput.style.height = Math.min(qInput.scrollHeight, 160) + 'px';
+  });
+
+  qInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      ask();
+    }
+  });
+
+  document.querySelectorAll('.example').forEach(el => {
+    el.addEventListener('click', () => {
+      qInput.value = el.dataset.q;
+      ask();
+    });
+  });
+
+  fetch('/health').then(r => r.json()).then(d => {
+    document.getElementById('stat-count').textContent = d.qdrant_count;
+    document.getElementById('stat-rerank').textContent = d.use_reranker ? '开启' : '关闭';
+    const ml = document.getElementById('model-list');
+    ml.innerHTML = '';
+    if (d.models && d.models.error) {
+      ml.innerHTML = '<span style="color:var(--red);font-size:12px">Ollama 不可用</span>';
+    } else {
+      Object.keys(d.models || {}).forEach(name => {
+        const size = (d.models[name] / 1e9).toFixed(1);
+        const pill = document.createElement('span');
+        pill.className = 'model-pill';
+        pill.textContent = `${name} (${size}GB)`;
+        ml.appendChild(pill);
+      });
+      if (!ml.children.length) {
+        ml.innerHTML = '<span style="color:var(--text-dim);font-size:12px">未发现模型</span>';
+      }
+    }
+  }).catch(() => {
+    document.getElementById('stat-count').innerHTML = '<span style="color:var(--red)">离线</span>';
+  });
+
+  function escapeHtml(s = '') {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function createVisualizer() {
+    const node = document.getElementById('visual-template').content.firstElementChild.cloneNode(true);
+    let index = 0;
+    const tick = () => {
+      const [phase, label] = phases[index % phases.length];
+      node.dataset.phase = phase;
+      node.querySelector('.visual-status').textContent = label;
+      node.querySelectorAll('.flow-step').forEach(step => {
+        const stepIndex = phases.findIndex(p => p[0] === step.dataset.step);
+        step.classList.toggle('active', step.dataset.step === phase);
+        step.classList.toggle('done', stepIndex < index % phases.length);
+      });
+      index += 1;
+    };
+    tick();
+    const interval = window.setInterval(tick, 1450);
+    return { node, stop: () => window.clearInterval(interval) };
+  }
+
+  function finalizeVisualizer(visualizer, trace, citations) {
+    visualizer.stop();
+    const node = visualizer.node;
+    node.dataset.phase = 'generate';
+    node.querySelector('.visual-status').textContent = '检索完成，已返回可引用 chunk';
+    const stageMap = trace && trace.stages ? trace.stages : {};
+    const metrics = {
+      chunk: '512/64',
+      embed: '1024d',
+      search: `${stageMap.vector?.count || 0}/${stageMap.bm25?.count || 0}`,
+      fuse: String(stageMap.rrf?.count || 0),
+      generate: String(stageMap.final?.count || citations.length || 0)
+    };
+    node.querySelectorAll('.flow-step').forEach(step => {
+      step.classList.remove('active');
+      step.classList.add('done');
+      step.querySelector('.step-metric').textContent = metrics[step.dataset.step] || '';
+    });
+    const items = node.querySelectorAll('.result-item');
+    items.forEach((item, i) => {
+      const c = citations[i];
+      if (!c) return;
+      const score = Number(c.score || 0);
+      item.children[0].textContent = `[${i + 1}]`;
+      item.querySelector('.bar span').style.width = `${Math.max(12, Math.min(100, score * 100))}%`;
+      item.querySelector('.result-score').textContent = score.toFixed(3);
+      item.title = `${c.filename || 'unknown'} | ${c.source || ''}`;
+    });
+  }
+
+  function renderCitations(cites) {
+    if (!cites || !cites.length) return '';
+    let html = '<div class="citations">';
+    cites.forEach((c, i) => {
+      const page = c.page ? ` 第 ${c.page} 页` : '';
+      const score = Number(c.score || 0).toFixed(3);
+      html += `
+        <div class="citation" data-idx="${i + 1}">
+          <div class="citation-head">
+            <span class="citation-num">[${i + 1}]</span>
+            <span>${escapeHtml(c.filename || '未知来源')}${page}</span>
+            <span class="citation-score">score ${score}</span>
+          </div>
+          <div class="citation-text">${escapeHtml(c.text || '').replace(/\n/g, '<br>')}</div>
+          <div class="citation-src">${escapeHtml(c.source || '')}</div>
+        </div>`;
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function renderAnswer(answer) {
+    return escapeHtml(answer)
+      .replace(/\[(\d+)\]/g, '<a class="cite" href="#cite-$1" onclick="scrollToCite($1)">[$1]</a>')
+      .replace(/\n/g, '<br>');
+  }
+
+  function scrollToCite(n) {
+    const el = document.querySelector(`.citation[data-idx="${n}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.style.background = 'var(--accent-soft)';
+      el.style.borderColor = 'var(--accent)';
+      setTimeout(() => {
+        el.style.background = 'var(--panel-2)';
+        el.style.borderColor = 'var(--border)';
+      }, 1200);
+    }
+  }
+
+  async function ask() {
+    const q = qInput.value.trim();
+    if (!q) return;
+    qInput.value = '';
+    qInput.style.height = 'auto';
+    sendBtn.disabled = true;
+
+    const empty = chat.querySelector('.empty');
+    if (empty) empty.remove();
+
+    chat.insertAdjacentHTML('beforeend', `
+      <div class="msg msg-q">
+        <div class="avatar">Q</div>
+        <div class="body">${escapeHtml(q)}</div>
+      </div>
+    `);
+
+    const loadingId = 'loading-' + Date.now();
+    const visualizer = createVisualizer();
+    chat.insertAdjacentHTML('beforeend', `
+      <div class="msg msg-a" id="${loadingId}">
+        <div class="avatar">A</div>
+        <div class="body">
+          <div class="visual-slot"></div>
+          <div class="loading-row">
+            <span class="loading-dot"></span><span class="loading-dot"></span><span class="loading-dot"></span>
+            <span>检索、排序与生成进行中...</span>
+          </div>
+        </div>
+      </div>
+    `);
+    document.querySelector(`#${loadingId} .visual-slot`).appendChild(visualizer.node);
+    chat.scrollTop = chat.scrollHeight;
+
+    try {
+      const t0 = performance.now();
+      const r = await fetch('/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q }),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      const totalMs = Math.round(performance.now() - t0);
+
+      finalizeVisualizer(visualizer, data.trace, data.citations || []);
+      const loading = document.getElementById(loadingId);
+      loading.querySelector('.loading-row').remove();
+      loading.querySelector('.body').insertAdjacentHTML('beforeend', `
+        <div class="answer-text">${renderAnswer(data.answer)}</div>
+        <div class="meta">
+          <span>服务耗时 ${(data.elapsed_ms / 1000).toFixed(1)}s</span>
+          <span>端到端 ${(totalMs / 1000).toFixed(1)}s</span>
+          <span>${(data.citations || []).length} 条引用</span>
+        </div>
+        ${renderCitations(data.citations || [])}
+      `);
+    } catch (e) {
+      visualizer.stop();
+      document.getElementById(loadingId).remove();
+      chat.insertAdjacentHTML('beforeend', `
+        <div class="msg msg-a">
+          <div class="avatar">A</div>
+          <div class="body">
+            <div class="answer-text" style="color:var(--red)">请求失败：${escapeHtml(e.message)}</div>
+          </div>
+        </div>
+      `);
+    } finally {
+      sendBtn.disabled = false;
+      chat.scrollTop = chat.scrollHeight;
+    }
+  }
+</script>
+</body>
+</html>

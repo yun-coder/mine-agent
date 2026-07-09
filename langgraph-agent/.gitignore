@@ -1,0 +1,18 @@
+# LangGraph Agent Platform — ignore patterns
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment config (contains secrets)
+.env
+
+# Stray artifacts
+=*.db

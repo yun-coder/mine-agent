@@ -1,0 +1,156 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "概览 / Overview",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 100 }] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(increase(agent_requests_total[1h]))", "legendFormat": "Requests/h", "refId": "A" }
+      ],
+      "title": "每小时请求数 / Requests/h",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "targets": [
+        { "expr": "sum(increase(agent_errors_total[1h]))", "legendFormat": "Errors/h", "refId": "A" }
+      ],
+      "title": "每小时错误数 / Errors/h",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(agent_request_duration_seconds_bucket[5m])) by (le, endpoint))", "legendFormat": "p95 {{endpoint}}", "refId": "A" }
+      ],
+      "title": "P95 延迟 / P95 Latency",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "targets": [
+        { "expr": "sum(increase(embed_cache_hits_total[5m])) / (sum(increase(embed_cache_hits_total[5m])) + sum(increase(embed_cache_misses_total[5m]))) * 100", "legendFormat": "Cache Hit %", "refId": "A" }
+      ],
+      "title": "嵌入缓存命中率 / Embedding Cache Hit Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 5,
+      "targets": [
+        { "expr": "agent_active_sessions", "legendFormat": "Active Sessions", "refId": "A" }
+      ],
+      "title": "活跃会话 / Active Sessions",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "targets": [
+        { "expr": "process_resident_memory_bytes{job=\"langgraph-agent\"}", "legendFormat": "Memory (MB)", "refId": "A" }
+      ],
+      "title": "内存使用 / Memory Usage",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 101,
+      "title": "请求分析 / Request Analysis",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 70, "lineWidth": 1 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(rate(agent_requests_total[5m])) by (method, endpoint)", "legendFormat": "{{method}} {{endpoint}}", "refId": "A" }
+      ],
+      "title": "请求速率 / Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 11,
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(agent_request_duration_seconds_bucket[5m])) by (le, endpoint))", "legendFormat": "p50 {{endpoint}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(agent_request_duration_seconds_bucket[5m])) by (le, endpoint))", "legendFormat": "p95 {{endpoint}}", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(agent_request_duration_seconds_bucket[5m])) by (le, endpoint))", "legendFormat": "p99 {{endpoint}}", "refId": "C" }
+      ],
+      "title": "请求延迟分布 / Request Latency Distribution",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 12,
+      "targets": [
+        { "expr": "sum(rate(agent_requests_total[5m])) by (status)", "legendFormat": "Status {{status}}", "refId": "A" }
+      ],
+      "title": "HTTP 状态码分布 / HTTP Status Distribution",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 13,
+      "targets": [
+        { "expr": "sum(increase(agent_errors_total[5m])) by (type)", "legendFormat": "{{type}}", "refId": "A" }
+      ],
+      "title": "错误趋势 / Error Trend",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 102,
+      "title": "系统健康 / System Health",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 23 },
+      "id": 20,
+      "options": { "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false }, "content": "## 系统健康检查 / System Health Checks\n\n| 服务 | 状态 | 说明 |\n|------|------|------|\n| Ollama LLM | `agent_ollama_llm_status` | 1=Connected, 0=Disconnected |\n| Ollama Embed | `agent_ollama_embed_status` | 1=Connected, 0=Disconnected |\n| Qdrant | `agent_qdrant_status` | 1=Connected, 0=Disconnected |\n| Langfuse | `agent_langfuse_status` | 1=Connected, 0=Disconnected |\n\n> 将以下 PromQL 查询添加到面板来监控各服务状态：\n> - Ollama LLM: `sum by (instance) (label_replace(up{job=\"langgraph-agent\"}, \"service\", \"ollama\", \"job\", \"langgraph-agent\"))`\n> - Qdrant: 通过 /health 端点的响应码推断", "showHeader": true },
+      "title": "服务健康矩阵 / Service Health Matrix",
+      "type": "text"
+    }
+  ],
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["langgraph-agent", "enterprise-kb"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "LangGraph Agent Platform",
+  "uid": "langgraph-agent",
+  "version": 1
+}
