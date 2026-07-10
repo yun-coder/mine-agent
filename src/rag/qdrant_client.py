@@ -136,8 +136,8 @@ class OllamaEmbedder:
     """轻量级嵌入器，使用 Ollama /api/embed（批量）或 /api/embeddings（单次）。
     带嵌入缓存以减少重复调用。"""
 
-    EMBED_MODEL: str = "bge-m3"
-    DIM: int = 1024
+    EMBED_MODEL: str = settings.embed_model
+    DIM: int = settings.embed_dim
 
     def __init__(self, base_url: str | None = None, model: str | None = None) -> None:
         self.base_url = base_url or settings.ollama_base_url

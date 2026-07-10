@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     top_k_rag: int = 10
     stream_chunk_size: int = 4
 
+    # 嵌入模型 / Embedding model
+    embed_model: str = "bge-m3"          # Ollama 嵌入模型名称
+    embed_dim: int = 1024                # 嵌入向量维度
+
     # RAG 检索增强 / RAG retrieval enhancement
     rag_use_hybrid_search: bool = True   # 开启向量+BM25+RRF混合检索
     rag_use_reranker: bool = False       # 开启BGE Reranker重排序

@@ -214,6 +214,10 @@ async def agent_stream(req: QuestionRequest, request: Request):
         # 编译图
         graph = get_compiled_graph(checkpoint=False)
 
+        final_answer = ""
+        chunks_buffer: list[str] = []
+        tool_log: list[dict] = []
+
         try:
             async for event_type, event_data in graph.astream_events(
                 initial, version="v2"
@@ -221,33 +225,39 @@ async def agent_stream(req: QuestionRequest, request: Request):
                 if event_type == "on_chat_model_stream":
                     content = event_data.get("data", {}).get("content", "")
                     if content:
+                        chunks_buffer.append(content)
                         yield f"data: {json.dumps({'type': 'token', 'data': content}, ensure_ascii=False)}\n\n"
+
+                elif event_type == "on_chat_model_end":
+                    # 捕获 LLM 最终回复，用于避免后续 invoke
+                    msg = event_data.get("data", {}).get("output", None)
+                    if msg and hasattr(msg, "content") and msg.content:
+                        final_answer = msg.content
 
                 elif event_type == "on_tool_start":
                     tool_name = event_data.get("name", "unknown")
                     yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name}, ensure_ascii=False)}\n\n"
 
                 elif event_type == "on_tool_end":
-                    yield f"data: {json.dumps({'type': 'tool_end', 'tool': event_data.get('name', '')}, ensure_ascii=False)}\n\n"
+                    tool_name = event_data.get("name", "")
+                    yield f"data: {json.dumps({'type': 'tool_end', 'tool': tool_name}, ensure_ascii=False)}\n\n"
+
+                elif event_type == "on_chain_end":
+                    # 尝试从最终状态提取 final_answer
+                    output = event_data.get("data", {}).get("output", {})
+                    if isinstance(output, dict):
+                        fa = output.get("final_answer", "")
+                        if fa:
+                            final_answer = fa
 
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
             return
 
-        # 获取最终结果
-        final_answer = ""
-        result: dict = {}
-        try:
-            result = graph.invoke(initial)
-            final_answer = result.get("final_answer", "")
-            if not final_answer:
-                for msg in reversed(result.get("messages", [])):
-                    if hasattr(msg, "content") and msg.content:
-                        final_answer = msg.content
-                        break
-        except Exception:
-            final_answer = ""
+        # 如果流式事件没有捕获到 final_answer，从累积的 chunk 拼接
+        if not final_answer and chunks_buffer:
+            final_answer = "".join(chunks_buffer).strip()
 
         if final_answer:
             chunk_size = settings.stream_chunk_size
@@ -257,7 +267,7 @@ async def agent_stream(req: QuestionRequest, request: Request):
 
         meta = {
             "type": "metadata",
-            "tool_log": result.get("tool_log", []) if result else [],
+            "tool_log": tool_log,
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
