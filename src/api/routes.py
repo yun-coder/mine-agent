@@ -8,6 +8,7 @@ import uuid
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from opentelemetry import trace
 from pydantic import BaseModel, Field, field_validator
 
@@ -219,32 +220,32 @@ async def agent_stream(req: QuestionRequest, request: Request):
         tool_log: list[dict] = []
 
         try:
-            async for event_type, event_data in graph.astream_events(
-                initial, version="v2"
-            ):
+            # langgraph 1.2.9+ 的 astream_events 返回 dict，不是 tuple
+            async for event in graph.astream_events(initial, version="v2"):
+                event_type = event.get("event", "")
+                event_data = event.get("data", {})
+
                 if event_type == "on_chat_model_stream":
-                    content = event_data.get("data", {}).get("content", "")
-                    if content:
-                        chunks_buffer.append(content)
-                        yield f"data: {json.dumps({'type': 'token', 'data': content}, ensure_ascii=False)}\n\n"
+                    chunk = event_data.get("chunk", None)
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        chunks_buffer.append(chunk.content)
+                        yield f"data: {json.dumps({'type': 'token', 'data': chunk.content}, ensure_ascii=False)}\n\n"
 
                 elif event_type == "on_chat_model_end":
-                    # 捕获 LLM 最终回复，用于避免后续 invoke
-                    msg = event_data.get("data", {}).get("output", None)
+                    msg = event_data.get("output", None)
                     if msg and hasattr(msg, "content") and msg.content:
                         final_answer = msg.content
 
                 elif event_type == "on_tool_start":
-                    tool_name = event_data.get("name", "unknown")
+                    tool_name = event.get("name", "unknown")
                     yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name}, ensure_ascii=False)}\n\n"
 
                 elif event_type == "on_tool_end":
-                    tool_name = event_data.get("name", "")
+                    tool_name = event.get("name", "")
                     yield f"data: {json.dumps({'type': 'tool_end', 'tool': tool_name}, ensure_ascii=False)}\n\n"
 
                 elif event_type == "on_chain_end":
-                    # 尝试从最终状态提取 final_answer
-                    output = event_data.get("data", {}).get("output", {})
+                    output = event_data.get("output", {})
                     if isinstance(output, dict):
                         fa = output.get("final_answer", "")
                         if fa:
@@ -272,8 +273,6 @@ async def agent_stream(req: QuestionRequest, request: Request):
         }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
-
-    from fastapi.responses import StreamingResponse
 
     return StreamingResponse(
         event_generator(),
@@ -334,9 +333,92 @@ class OpenAIChatCompletionResponse(BaseModel):
     usage: OpenAIUsage
 
 
+async def _openai_chat_completions_stream(
+    req: OpenAIChatCompletionRequest,
+    lc_messages: list,
+) -> StreamingResponse:
+    """OpenAI 兼容的流式 SSE 响应 — 供 OpenWebUI 使用。"""
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        initial: AgentState = {
+            "messages": lc_messages,
+            "query": lc_messages[-1].content if lc_messages else "",
+            "session_id": "",
+            "final_answer": "",
+            "tool_log": [],
+            "iteration_count": 0,
+        }
+
+        graph = get_compiled_graph(checkpoint=False)
+        full_answer = ""
+        chunks_buffer: list[str] = []
+
+        try:
+            async for event in graph.astream_events(initial, version="v2"):
+                event_type = event.get("event", "")
+
+                if event_type == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk", None)
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        chunks_buffer.append(chunk.content)
+                        # OpenAI 流式格式：data: {"choices": [{"delta": {"content": "..."}, "index": 0}]}
+                        payload = {
+                            "choices": [{"delta": {"content": chunk.content}, "index": 0}],
+                        }
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+                elif event_type == "on_chat_model_end":
+                    msg = event.get("data", {}).get("output", None)
+                    if msg and hasattr(msg, "content") and msg.content:
+                        full_answer = msg.content
+
+                elif event_type == "on_chain_end":
+                    output = event.get("data", {}).get("output", {})
+                    if isinstance(output, dict):
+                        fa = output.get("final_answer", "")
+                        if fa:
+                            full_answer = fa
+
+        except Exception as exc:
+            logger = __import__("loguru").logger
+            logger.error(f"[OpenAI Stream] Agent error: {exc}")
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': ''}, 'finish_reason': 'stop', 'index': 0}]})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        if not full_answer and chunks_buffer:
+            full_answer = "".join(chunks_buffer).strip()
+
+        if full_answer:
+            chunk_size = settings.stream_chunk_size
+            for i in range(0, len(full_answer), chunk_size):
+                chunk = full_answer[i : i + chunk_size]
+                payload = {
+                    "choices": [{"delta": {"content": chunk}, "index": 0}],
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        # 结束标记
+        yield f"data: {json.dumps({'choices': [{'delta': {'content': ''}, 'finish_reason': 'stop', 'index': 0}]})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @openai_router.post("/chat/completions", dependencies=[Depends(api_key_auth)])
 async def openai_chat_completions(req: OpenAIChatCompletionRequest):
-    """OpenAI 兼容的 chat completions 端点 — 供 OpenWebUI 调用。"""
+    """OpenAI 兼容的 chat completions 端点 — 供 OpenWebUI 调用。
+
+    支持 stream=true 的 SSE 流式响应和 stream=false 的 JSON 响应。
+    """
     from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
     # 转换 OpenAI 消息格式为 LangChain 消息
@@ -351,12 +433,15 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
         elif msg.role == "tool":
             lc_messages.append(ToolMessage(content=msg.content, tool_call_id=""))
 
-    # 运行智能体（传入完整消息历史）
+    if req.stream:
+        return await _openai_chat_completions_stream(req, lc_messages)
+
+    # 非流式：直接返回 JSON
     result = run_agent(
         question=req.messages[-1].content if req.messages else "",
         session_id="",
         checkpoint=False,
-        messages=lc_messages,  # 传递完整对话历史
+        messages=lc_messages,
     )
     answer = result.get("final_answer", result.get("answer", ""))
 
