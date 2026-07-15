@@ -36,6 +36,13 @@ def setup_graceful_shutdown():
         except Exception as exc:
             logger.warning(f"[Shutdown] 关闭 LLM 客户端失败: {exc}")
 
+        try:
+            from src.agent.graph import close_checkpointer
+            close_checkpointer()
+            logger.info("[Shutdown] Checkpointer closed")
+        except Exception as exc:
+            logger.warning(f"[Shutdown] Checkpointer close failed: {exc}")
+
         logger.info("[Shutdown] 关闭完成 / Shutdown complete")
         sys.exit(0)
 

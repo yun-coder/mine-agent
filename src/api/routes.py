@@ -3,27 +3,49 @@
 from __future__ import annotations
 
 import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import time
 import uuid
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from langchain_core.messages import HumanMessage, SystemMessage
 from opentelemetry import trace
 from pydantic import BaseModel, Field, field_validator
 
-from src.agent.graph import run_agent, get_compiled_graph, AgentState
+from src.agent.graph import (
+    AgentExecutionError,
+    run_agent,
+    get_compiled_graph_async,
+    AgentState,
+)
 from src.config import settings
 from src.api.auth import api_key_auth
 from src.api.rate_limit import check_rate_limit
 from src.tdai_client import get_client
 from loguru import logger
+import httpx
 
 router = APIRouter(prefix="/api/v1")
 
 # OpenAI-compatible router mounted at root level
 openai_router = APIRouter()
+
+
+def _agent_http_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, AgentExecutionError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="模型服务暂时不可用 / Model service temporarily unavailable",
+            headers={"Retry-After": "5"},
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="智能体执行失败 / Agent execution failed",
+    )
 
 # ------------------------------------------------------------------
 # 请求 / 响应模型 / Request / Response models
@@ -64,8 +86,7 @@ class AgentResponse(BaseModel):
 # ------------------------------------------------------------------
 
 
-@router.get("/health", response_model=HealthResponse)
-def health_check():
+def _health_check_serial():
     """检查所有下游服务的连接状态 / Check connectivity to all downstream services.
 
     Note: This endpoint is exempt from API key auth (it's a health check).
@@ -82,7 +103,7 @@ def health_check():
     # 检查 Qdrant / Check Qdrant
     try:
         from qdrant_client import QdrantClient
-        client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=5)
+        client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=3)
         count = client.count(settings.qdrant_collection)
         health["qdrant"] = f"connected (points={count.count})"
     except Exception as exc:
@@ -92,7 +113,7 @@ def health_check():
     # 检查 Ollama LLM / Check Ollama LLM
     try:
         import httpx
-        with httpx.Client(timeout=5) as c:
+        with httpx.Client(timeout=3) as c:
             r = c.get(f"{settings.ollama_base_url}/api/tags")
             models = [m["name"] for m in r.json().get("models", [])]
             llm_model = models[0] if models else None
@@ -103,10 +124,10 @@ def health_check():
 
     # 检查 Ollama Embed / Check Ollama Embedder
     try:
-        with httpx.Client(timeout=5) as c:
+        with httpx.Client(timeout=3) as c:
             r = c.post(
                 f"{settings.ollama_base_url}/api/embeddings",
-                json={"model": "bge-m3", "prompt": "health check"},
+                json={"model": settings.embed_model, "prompt": "health check"},
             )
             if r.status_code == 200:
                 health["ollama_embed"] = "connected"
@@ -119,7 +140,7 @@ def health_check():
 
     # 检查 Langfuse / Check Langfuse
     try:
-        with httpx.Client(timeout=5) as c:
+        with httpx.Client(timeout=3) as c:
             r = c.get(f"{settings.langfuse_host}/api/public/health")
             if r.status_code == 200:
                 health["langfuse"] = "connected"
@@ -129,6 +150,97 @@ def health_check():
         health["langfuse"] = "error: unreachable"
 
     return HealthResponse(**health)
+
+
+def _health_qdrant() -> str:
+    from qdrant_client import QdrantClient
+
+    client = QdrantClient(
+        host=settings.qdrant_host,
+        port=settings.qdrant_port,
+        timeout=3,
+    )
+    count = client.count(settings.qdrant_collection)
+    return f"connected (points={count.count})"
+
+
+def _health_ollama_llm() -> str:
+    with httpx.Client(timeout=3) as client:
+        response = client.get(f"{settings.ollama_base_url}/api/tags")
+        response.raise_for_status()
+        models = [model["name"] for model in response.json().get("models", [])]
+    return f"connected (models={models})" if models else "connected (no models)"
+
+
+def _health_ollama_embed() -> str:
+    with httpx.Client(timeout=3) as client:
+        response = client.get(f"{settings.ollama_base_url}/api/tags")
+        response.raise_for_status()
+        models = {model["name"] for model in response.json().get("models", [])}
+    model_available = any(
+        name == settings.embed_model
+        or name.split(":", 1)[0] == settings.embed_model
+        for name in models
+    )
+    if not model_available:
+        return f"error: model {settings.embed_model} missing"
+    return f"connected (model={settings.embed_model})"
+
+
+def _health_langfuse() -> str:
+    with httpx.Client(timeout=3) as client:
+        response = client.get(f"{settings.langfuse_host}/api/public/health")
+        response.raise_for_status()
+    return "connected"
+
+
+def _health_check_sync():
+    health = {
+        "status": "ok",
+        "version": "1.0.0",
+        "qdrant": "disconnected",
+        "ollama_llm": "disconnected",
+        "ollama_embed": "disconnected",
+        "langfuse": "disconnected",
+    }
+    probes = {
+        "qdrant": _health_qdrant,
+        "ollama_llm": _health_ollama_llm,
+        "ollama_embed": _health_ollama_embed,
+        "langfuse": _health_langfuse,
+    }
+    with ThreadPoolExecutor(max_workers=len(probes)) as pool:
+        futures = {pool.submit(probe): name for name, probe in probes.items()}
+        for future, name in ((future, futures[future]) for future in futures):
+            try:
+                health[name] = future.result(timeout=4)
+            except Exception as exc:
+                health[name] = f"error: {type(exc).__name__}"
+                health["status"] = "degraded"
+    if any(
+        str(health[name]).startswith(("error", "timeout"))
+        for name in probes
+    ):
+        health["status"] = "degraded"
+    return HealthResponse(**health)
+
+
+@router.get("/health", response_model=HealthResponse, include_in_schema=False)
+async def health_check():
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_health_check_sync),
+            timeout=6,
+        )
+    except asyncio.TimeoutError:
+        return HealthResponse(
+            status="degraded",
+            version="1.0.0",
+            qdrant="timeout",
+            ollama_llm="timeout",
+            ollama_embed="timeout",
+            langfuse="timeout",
+        )
 
 
 # ------------------------------------------------------------------
@@ -159,14 +271,16 @@ async def agent_ask(req: QuestionRequest, request: Request):
         span.set_attribute("input", req.question)
         span.set_attribute("session_id", req.session_id)
         try:
-            result = run_agent(
+            result = await run_in_threadpool(
+                run_agent,
                 question=req.question,
-                session_id=req.session_id,
-                checkpoint=False,
+                session_id=req.session_id.strip() or uuid.uuid4().hex,
+                checkpoint=settings.checkpoint_enabled,
             )
         except Exception as exc:
             span.set_attribute("error", str(exc))
-            raise HTTPException(500, f"智能体执行失败 / Agent execution failed: {exc}")
+            logger.exception(f"[Agent API] execution failed: {exc}")
+            raise _agent_http_exception(exc) from exc
         answer = result.get("final_answer", result.get("answer", ""))
         span.set_attribute("output", answer)
         span.set_attribute("answer_length", len(answer))
@@ -176,7 +290,7 @@ async def agent_ask(req: QuestionRequest, request: Request):
     return AgentResponse(
         answer=result.get("final_answer", result.get("answer", "")),
         tool_log=result.get("tool_log", []),
-        session_id=req.session_id,
+        session_id=result.get("session_id", req.session_id),
         elapsed_ms=elapsed,
     )
 
@@ -211,7 +325,8 @@ async def agent_stream(req: QuestionRequest, request: Request):
 
         if tdai.enabled:
             try:
-                memory_result = tdai.sync_recall(
+                memory_result = await asyncio.to_thread(
+                    tdai.sync_recall,
                     query=req.question,
                     session_key=req.session_id or "default",
                 )
@@ -243,14 +358,23 @@ async def agent_stream(req: QuestionRequest, request: Request):
         }
 
         # 编译图
-        graph = get_compiled_graph(checkpoint=False)
+        graph = await get_compiled_graph_async(checkpoint=settings.checkpoint_enabled)
+        thread_id = req.session_id.strip() or uuid.uuid4().hex
+        run_config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": max(10, settings.max_iterations * 4),
+        }
 
         final_answer = ""
         chunks_buffer: list[str] = []
 
         try:
             # langgraph 1.2.9+ 的 astream_events 返回 dict，不是 tuple
-            async for event in graph.astream_events(initial, version="v2"):
+            async for event in graph.astream_events(
+                initial,
+                config=run_config,
+                version="v2",
+            ):
                 event_type = event.get("event", "")
                 event_data = event.get("data", {})
 
@@ -283,7 +407,19 @@ async def agent_stream(req: QuestionRequest, request: Request):
                             final_answer = fa
 
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+            logger.exception(f"[Agent Stream] execution failed: {exc}")
+            payload = {
+                "type": "error",
+                "code": "agent_unavailable"
+                if isinstance(exc, AgentExecutionError)
+                else "agent_execution_failed",
+                "message": (
+                    "模型服务暂时不可用 / Model service temporarily unavailable"
+                    if isinstance(exc, AgentExecutionError)
+                    else "智能体执行失败 / Agent execution failed"
+                ),
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
             return
 
@@ -294,7 +430,8 @@ async def agent_stream(req: QuestionRequest, request: Request):
         # TDAI 记忆保存（与同步 run_agent 一致）/ TDAI memory capture
         if tdai.enabled and final_answer:
             try:
-                tdai.sync_capture(
+                await asyncio.to_thread(
+                    tdai.sync_capture,
                     user_content=req.question,
                     assistant_content=final_answer,
                     session_key=req.session_id or "default",
@@ -304,15 +441,10 @@ async def agent_stream(req: QuestionRequest, request: Request):
             except Exception as exc:
                 logger.debug(f"[TDAI] 保存失败（不影响主流程）/ Capture failed (non-fatal): {exc}")
 
-        if final_answer:
-            chunk_size = settings.stream_chunk_size
-            for i in range(0, len(final_answer), chunk_size):
-                chunk = final_answer[i : i + chunk_size]
-                yield f"data: {json.dumps({'type': 'token', 'data': chunk}, ensure_ascii=False)}\n\n"
-
         meta = {
             "type": "metadata",
             "tool_log": tool_log,
+            "session_id": thread_id,
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
@@ -334,10 +466,10 @@ async def agent_stream(req: QuestionRequest, request: Request):
 # ------------------------------------------------------------------
 
 
-@router.post("/agent")
-def agent_legacy(req: QuestionRequest):
+@router.post("/agent", dependencies=[Depends(api_key_auth)])
+async def agent_legacy(req: QuestionRequest, request: Request):
     """旧版端点 — 重定向到 /agent/ask。"""
-    return agent_ask(req)
+    return await agent_ask(req, request)
 
 
 # ------------------------------------------------------------------
@@ -390,7 +522,11 @@ async def _openai_chat_completions_stream(
         messages_base = list(lc_messages)
         if tdai.enabled:
             try:
-                memory_result = tdai.sync_recall(query=user_query, session_key="default")
+                memory_result = await asyncio.to_thread(
+                    tdai.sync_recall,
+                    query=user_query,
+                    session_key="default",
+                )
                 system_ctx = memory_result.get("appendSystemContext", "")
                 if system_ctx:
                     memory_msg = SystemMessage(
@@ -413,12 +549,21 @@ async def _openai_chat_completions_stream(
             "iteration_count": 0,
         }
 
-        graph = get_compiled_graph(checkpoint=False)
+        graph = await get_compiled_graph_async(checkpoint=settings.checkpoint_enabled)
+        thread_id = uuid.uuid4().hex
+        run_config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": max(10, settings.max_iterations * 4),
+        }
         full_answer = ""
         chunks_buffer: list[str] = []
 
         try:
-            async for event in graph.astream_events(initial, version="v2"):
+            async for event in graph.astream_events(
+                initial,
+                config=run_config,
+                version="v2",
+            ):
                 event_type = event.get("event", "")
 
                 if event_type == "on_chat_model_stream":
@@ -444,9 +589,23 @@ async def _openai_chat_completions_stream(
                             full_answer = fa
 
         except Exception as exc:
-            logger = __import__("loguru").logger
             logger.error(f"[OpenAI Stream] Agent error: {exc}")
-            yield f"data: {json.dumps({'choices': [{'delta': {'content': ''}, 'finish_reason': 'stop', 'index': 0}]})}\n\n"
+            error = {
+                "error": {
+                    "message": (
+                        "Model service temporarily unavailable"
+                        if isinstance(exc, AgentExecutionError)
+                        else "Agent execution failed"
+                    ),
+                    "type": "server_error",
+                    "code": (
+                        "agent_unavailable"
+                        if isinstance(exc, AgentExecutionError)
+                        else "agent_execution_failed"
+                    ),
+                }
+            }
+            yield f"data: {json.dumps(error)}\n\n"
             yield "data: [DONE]\n\n"
             return
 
@@ -456,7 +615,8 @@ async def _openai_chat_completions_stream(
         # TDAI 记忆保存 / TDAI memory capture
         if tdai.enabled and full_answer:
             try:
-                tdai.sync_capture(
+                await asyncio.to_thread(
+                    tdai.sync_capture,
                     user_content=user_query,
                     assistant_content=full_answer,
                     session_key="default",
@@ -464,15 +624,6 @@ async def _openai_chat_completions_stream(
                 logger.debug("[TDAI] OpenAI 流式对话已保存到记忆系统")
             except Exception as exc:
                 logger.debug(f"[TDAI] OpenAI 流式保存失败（不影响主流程）: {exc}")
-
-        if full_answer:
-            chunk_size = settings.stream_chunk_size
-            for i in range(0, len(full_answer), chunk_size):
-                chunk = full_answer[i : i + chunk_size]
-                payload = {
-                    "choices": [{"delta": {"content": chunk}, "index": 0}],
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         # 结束标记
         yield f"data: {json.dumps({'choices': [{'delta': {'content': ''}, 'finish_reason': 'stop', 'index': 0}]})}\n\n"
@@ -490,11 +641,25 @@ async def _openai_chat_completions_stream(
 
 
 @openai_router.post("/chat/completions", dependencies=[Depends(api_key_auth)])
-async def openai_chat_completions(req: OpenAIChatCompletionRequest):
+async def openai_chat_completions(req: OpenAIChatCompletionRequest, request: Request):
     """OpenAI 兼容的 chat completions 端点 — 供 OpenWebUI 调用。
 
     支持 stream=true 的 SSE 流式响应和 stream=false 的 JSON 响应。
     """
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, limit, remaining = await check_rate_limit(
+        "/v1/chat/completions",
+        key=client_ip,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many requests. Limit: {limit}/min, Remaining: {remaining}",
+            headers={"Retry-After": "60"},
+        )
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+
     from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
     # 转换 OpenAI 消息格式为 LangChain 消息
@@ -513,12 +678,17 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
         return await _openai_chat_completions_stream(req, lc_messages)
 
     # 非流式：直接返回 JSON
-    result = run_agent(
-        question=req.messages[-1].content if req.messages else "",
-        session_id="",
-        checkpoint=False,
-        messages=lc_messages,
-    )
+    try:
+        result = await run_in_threadpool(
+            run_agent,
+            question=req.messages[-1].content,
+            session_id=request.headers.get("X-Session-ID", "").strip() or uuid.uuid4().hex,
+            checkpoint=settings.checkpoint_enabled,
+            messages=lc_messages,
+        )
+    except Exception as exc:
+        logger.exception(f"[OpenAI API] execution failed: {exc}")
+        raise _agent_http_exception(exc) from exc
     answer = result.get("final_answer", result.get("answer", ""))
 
     return OpenAIChatCompletionResponse(
@@ -535,6 +705,6 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
 
 
 @openai_router.post("/v1/chat/completions", dependencies=[Depends(api_key_auth)])
-async def openai_chat_completions_v1(req: OpenAIChatCompletionRequest):
+async def openai_chat_completions_v1(req: OpenAIChatCompletionRequest, request: Request):
     """OpenAI 兼容的 chat completions 端点（带 /v1 前缀）。"""
-    return await openai_chat_completions(req)
+    return await openai_chat_completions(req, request)

@@ -6,9 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    api_key: str = ""
+    api_auth_disabled: bool = False
+
     # Ollama 配置 / Ollama
     ollama_base_url: str = "http://127.0.0.1:11434"
-    llm_model: str = "qwen3:8b"
+    llm_model: str = "qwen2.5:7b"
 
     # Qdrant 配置 / Qdrant
     qdrant_host: str = "127.0.0.1"
@@ -25,6 +28,9 @@ class Settings(BaseSettings):
     max_agent_retries: int = 1        # 智能体重试次数 / Agent retry count
     top_k_rag: int = 10
     stream_chunk_size: int = 50
+    terminal_enabled: bool = False
+    checkpoint_enabled: bool = True
+    checkpoint_required: bool = False
 
     # 嵌入模型 / Embedding model
     embed_model: str = "bge-m3"          # Ollama 嵌入模型名称

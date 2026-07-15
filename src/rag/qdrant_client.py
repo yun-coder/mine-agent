@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import pickle
 import re
 import time
@@ -112,6 +113,35 @@ class _EmbedCache:
 _embed_cache = _EmbedCache()
 
 
+def _validate_embedding_vectors(
+    vectors: Any,
+    expected_count: int,
+    expected_dim: int,
+) -> list[list[float]]:
+    """Reject malformed embeddings before they can reach Qdrant."""
+    if not isinstance(vectors, list) or len(vectors) != expected_count:
+        received = len(vectors) if isinstance(vectors, list) else "invalid"
+        raise RuntimeError(
+            f"Embedding count mismatch: expected {expected_count}, "
+            f"received {received}"
+        )
+    validated: list[list[float]] = []
+    for index, vector in enumerate(vectors):
+        if not isinstance(vector, list) or len(vector) != expected_dim:
+            received = len(vector) if isinstance(vector, list) else "invalid"
+            raise RuntimeError(
+                f"Embedding {index} dimension mismatch: expected {expected_dim}, "
+                f"received {received}"
+            )
+        numeric = [float(value) for value in vector]
+        if not all(math.isfinite(value) for value in numeric):
+            raise RuntimeError(f"Embedding {index} contains non-finite values")
+        if math.sqrt(sum(value * value for value in numeric)) <= 1e-12:
+            raise RuntimeError(f"Embedding {index} is a zero vector")
+        validated.append(numeric)
+    return validated
+
+
 # ======================================================================
 # BM25 工具函数 / BM25 helpers
 # ======================================================================
@@ -180,19 +210,28 @@ class OllamaEmbedder:
                 cached[idx] = vec
                 _embed_cache.put(texts[idx], vec)
 
-        return [cached[i] for i in range(len(texts))]
+        return _validate_embedding_vectors(
+            [cached[i] for i in range(len(texts))],
+            expected_count=len(texts),
+            expected_dim=self.DIM,
+        )
 
     def _call_ollama(self, texts: list[str]) -> list[list[float]]:
         """实际调用 Ollama API / Actually call Ollama API."""
         # 熔断器检查 / Circuit breaker check
         cb = get_ollama_circuit()
         if not cb.can_execute():
-            logger.warning("[Embedder] Ollama 熔断器已开启，返回空向量 / Circuit open, returning empty vectors")
-            return [0.0] * self.DIM
+            logger.warning("[Embedder] Ollama 熔断器已开启 / Circuit open")
+            raise RuntimeError("Ollama circuit breaker is open")
 
         if self._use_batch:
             try:
                 result = self._embed_batch(texts)
+                result = _validate_embedding_vectors(
+                    result,
+                    expected_count=len(texts),
+                    expected_dim=self.DIM,
+                )
                 cb.record_success()
                 return result
             except Exception as exc:
@@ -201,6 +240,11 @@ class OllamaEmbedder:
 
         try:
             result = self._embed_per_request(texts)
+            result = _validate_embedding_vectors(
+                result,
+                expected_count=len(texts),
+                expected_dim=self.DIM,
+            )
             cb.record_success()
             return result
         except Exception as exc:
@@ -281,7 +325,12 @@ class QdrantConnector:
 
     def _resolve_bm25_path(self) -> Path:
         if settings.rag_bm25_path:
-            return Path(settings.rag_bm25_path)
+            path = Path(settings.rag_bm25_path)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(f"[BM25] 无法创建持久化目录 {path.parent}: {exc}")
+            return path
         # 自动选择：优先用项目根下的 data/bm25，然后是 rag-pipeline 的缓存
         candidates = [
             settings.project_root / "data" / "qdrant" / f"{self.collection}.bm25.pkl",
@@ -513,13 +562,13 @@ class QdrantConnector:
             )
         qfilter = Filter(must=conditions) if conditions else None
 
-        results = self.client.search(
+        results = self.client.query_points(
             collection_name=self.collection,
-            query_vector=vec,
+            query=vec,
             limit=top_k,
             query_filter=qfilter,
             with_payload=True,
-        )
+        ).points
         return [
             {
                 "id": str(r.id),

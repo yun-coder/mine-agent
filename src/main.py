@@ -17,7 +17,7 @@ from loguru import logger
 from src.shutdown import setup_graceful_shutdown
 from src.config_validate import validate_dependencies
 from src.metrics import init_metrics
-from src.api.routes import router as api_router, openai_router
+from src.api.routes import router as api_router, openai_router, health_check
 
 
 def create_app() -> FastAPI:
@@ -57,6 +57,14 @@ def create_app() -> FastAPI:
             "agent_ask": "POST /api/v1/agent/ask",
             "agent_stream": "POST /api/v1/agent/stream",
         }
+
+    @app.get("/health", include_in_schema=False)
+    async def root_health():
+        return await health_check()
+
+    @app.get("/health/live", include_in_schema=False)
+    async def liveness():
+        return {"status": "ok"}
 
     # OpenAI 兼容的 models 端点 — 供 OpenWebUI 发现模型
     # OpenWebUI 请求的是 /models（不带 /v1 前缀）

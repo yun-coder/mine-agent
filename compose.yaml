@@ -5,10 +5,16 @@ services:
     container_name: langgraph-agent
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     environment:
+      - API_KEY=${API_KEY:?API_KEY must be set}
+      - API_AUTH_DISABLED=false
+      - TERMINAL_ENABLED=false
+      - CHECKPOINT_ENABLED=true
+      - CHECKPOINT_REQUIRED=true
+      - RAG_BM25_PATH=/app/data/qdrant/${QDRANT_COLLECTION:-enterprise_kb}.bm25.pkl
       # Docker 环境下覆盖 localhost → host.docker.internal
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - QDRANT_HOST=host.docker.internal
@@ -19,27 +25,35 @@ services:
     volumes:
       - D:/data/docs:/data/docs:ro
       - D:/projects:/projects:ro
+      - agent-cache:/app/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     deploy:
       resources:
         limits:
           memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   open-webui:
-    image: openwebui/open-webui:latest
+    image: openwebui/open-webui:latest@sha256:a26effeb220e132482bf7e0560b3404843e7bc40d23051144e062960df8df6b0
     container_name: open-webui-agent
     restart: unless-stopped
     ports:
-      - "3000:8080"
+      - "127.0.0.1:3000:8080"
     volumes:
       - D:/data/open-webui:/app/backend/data
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - WEBUI_AUTH=false
+      - WEBUI_AUTH=true
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY must be set}
       # 指向同 compose 内的 langgraph-agent（Docker 网络直连）
-      - OPENAI_API_BASE_URLS=http://agent-platform:8000
-      - OPENAI_API_KEYS=not-needed
+      - OPENAI_API_BASE_URLS=http://agent-platform:8000/v1
+      - OPENAI_API_KEYS=${API_KEY:?API_KEY must be set}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -48,3 +62,6 @@ services:
       resources:
         limits:
           memory: 2G
+
+volumes:
+  agent-cache:

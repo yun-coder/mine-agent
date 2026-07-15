@@ -69,6 +69,26 @@ BLOCKED_PATTERNS: list[str] = [
 
 _BLOCKED_RE = re.compile("|".join(BLOCKED_PATTERNS), re.IGNORECASE)
 
+_SAFE_COMMANDS = {
+    "cat", "dir", "docker", "echo", "find", "get-childitem", "get-content",
+    "get-location", "git", "grep", "head", "ls", "pwd",
+    "select-string", "tail", "type", "where",
+}
+_SENSITIVE_NAME_RE = re.compile(
+    r"(^|[\\/\s\"'])"
+    r"(\.env(?:\.[^\\/\s\"']+)?|"
+    r"\.git-credentials|credentials(?:\.[^\\/\s\"']+)?|"
+    r"secrets?(?:\.[^\\/\s\"']+)?|"
+    r"id_rsa(?:\.[^\\/\s\"']+)?|id_ed25519(?:\.[^\\/\s\"']+)?|"
+    r"[^\\/\s\"']+\.(?:pem|key|p12|pfx))"
+    r"(?=$|[\\/\s\"'])",
+    re.IGNORECASE,
+)
+_READ_ONLY_SUBCOMMANDS = {
+    "docker": {"info", "images", "ps", "version"},
+    "git": {"branch", "diff", "log", "ls-files", "rev-parse", "show", "status"},
+}
+
 # ------------------------------------------------------------------
 # 2. 路径白名单 / Path allowlist
 # ------------------------------------------------------------------
@@ -94,6 +114,79 @@ if os.name != "nt":
     _DEFAULT_ALLOWLIST.append(Path("/var/tmp"))
 
 ALLOWED_DIRS: list[Path] = _DEFAULT_ALLOWLIST
+
+
+def get_allowed_dirs() -> list[Path]:
+    """Return the current roots shared by file and terminal tools."""
+    roots = list(ALLOWED_DIRS)
+    for raw in (
+        os.environ.get("DOCS_DIR", ""),
+        os.environ.get("PROJECT_ROOT", ""),
+    ):
+        if raw:
+            roots.append(Path(raw))
+    roots.extend((settings.docs_dir, settings.project_root))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def resolve_allowed_path(
+    raw_path: str,
+    *,
+    base_dir: Path | None = None,
+    must_exist: bool = False,
+    expect_dir: bool | None = None,
+) -> Path | None:
+    """Resolve a path only when it stays below a configured read-only root."""
+    if not raw_path or "\x00" in raw_path:
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base_dir or settings.project_root) / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        return None
+
+    for root in get_allowed_dirs():
+        try:
+            resolved.relative_to(root)
+            break
+        except ValueError:
+            continue
+    else:
+        return None
+
+    if must_exist and not resolved.exists():
+        return None
+    if expect_dir is True and not resolved.is_dir():
+        return None
+    if expect_dir is False and not resolved.is_file():
+        return None
+    return resolved
+
+
+def is_sensitive_path(path: Path) -> bool:
+    """Return whether a path commonly contains credentials or secrets."""
+    name = path.name.lower()
+    if name == ".env" or name.startswith(".env."):
+        return True
+    if name in {".git-credentials", "id_rsa", "id_ed25519"}:
+        return True
+    if name.startswith("secret") or name.startswith("credential"):
+        return True
+    return path.suffix.lower() in {".pem", ".key", ".p12", ".pfx"}
 
 
 def set_allowed_dirs(directories: list[str] | list[Path]) -> None:
@@ -135,6 +228,33 @@ def terminal_sanitizer(command: str) -> dict[str, Any]:
         logger.warning(f"[沙箱 / Sanitizer] 拦截 / blocked: {reason} — 输入={stripped[:200]}")
         return {"safe": False, "reason": reason}
 
+    if re.search(r"[;&|<>`]|\$\(|\$\{", stripped):
+        return {"safe": False, "reason": "shell operators are not allowed"}
+    if re.search(r"(^|[\s\"'])\.\.[\\/]", stripped) or re.search(
+        r"(^|[\s\"'])~[\\/]", stripped
+    ):
+        return {"safe": False, "reason": "relative traversal is not allowed"}
+    if re.search(r"\b(python|python3|node|perl|ruby)\s+(-c|-e|-m)\b", stripped, re.IGNORECASE):
+        return {"safe": False, "reason": "inline code execution is not allowed"}
+
+    command_name = re.split(r"[\s/\\]", stripped, maxsplit=1)[0].lower()
+    if command_name not in _SAFE_COMMANDS:
+        return {
+            "safe": False,
+            "reason": f"command is not in the read-only allowlist: {command_name}",
+        }
+    if _SENSITIVE_NAME_RE.search(stripped):
+        return {"safe": False, "reason": "access to credential or secret files is not allowed"}
+
+    if command_name in _READ_ONLY_SUBCOMMANDS:
+        remainder = stripped[len(command_name):].strip()
+        subcommand = remainder.split(None, 1)[0].lower() if remainder else ""
+        if subcommand not in _READ_ONLY_SUBCOMMANDS[command_name]:
+            return {
+                "safe": False,
+                "reason": f"{command_name} subcommand is not in the read-only allowlist",
+            }
+
     # --- 第二层：路径白名单 / --- Layer 2: path allowlist ---
     cmd_paths = extract_paths(stripped)
     for raw_path in cmd_paths:
@@ -147,7 +267,7 @@ def terminal_sanitizer(command: str) -> dict[str, Any]:
             continue
         if not any(
             resolved.is_relative_to(d.resolve() if d.is_dir() else d)
-            for d in ALLOWED_DIRS
+            for d in get_allowed_dirs()
         ):
             reason = f"路径不在白名单内 / Path outside allowlist: {raw_path}"
             logger.warning(f"[沙箱 / Sanitizer] 路径拦截 / path blocked: {reason} — 命令={stripped[:200]}")

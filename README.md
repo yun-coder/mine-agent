@@ -16,11 +16,11 @@ FastAPI Server (:8000)
   ├─ /api/v1/agent/ask     — 同步问答 / Synchronous Q&A
   ├─ /api/v1/agent/stream  — SSE 流式输出 / SSE streaming
   ├─ /chat/completions     — OpenAI 兼容接口 / OpenAI-compatible
-  └─ /health               — 健康检查 / Health check
+  └─ /health/live          — 存活检查 / Liveness check
   │
   ▼
 LangGraph StateGraph (Agentic RAG)
-  create_react_agent (subgraph)
+  create_agent (subgraph)
       │
       Agent 拥有全部工具，自主决策何时/是否调用：
       ├─ rag_query          — 搜索知识库 (Qdrant + BM25)
@@ -121,17 +121,55 @@ uvicorn src.main:app --host 0.0.0.0 --port 8000
 docker compose up -d
 ```
 
-启动：`agent-platform` (:8001) + `open-webui` (:3000)
+生产部署要求：
+
+- 必须设置 `API_KEY`，并保持 `API_AUTH_DISABLED=false`
+- 推荐启用 `CHECKPOINT_ENABLED=true` 与 `CHECKPOINT_REQUIRED=true`
+- `TERMINAL_ENABLED` 默认保持 `false`
+- 使用统一编排文件时，确保 compose 的变量来源包含项目 `.env`，避免空 shell 变量覆盖 `API_KEY`
+- 统一编排会先运行 `postgres-provision`，通过
+  `scripts/provision_postgres_app_role.sql` 幂等创建非超级用户 `langfuse_app`
+- Langfuse Web、Worker 与 Agent 只使用 `langfuse_app`；`langfuse` 保留为数据库管理账号
+- 统一编排中的外部镜像按 SHA-256 摘要锁定，升级时应先完成测试与备份恢复演练，再显式更新摘要
+
+启动：`langgraph-agent` (:8000) + `open-webui` (:3000)
+
+## Production Validation / 生产验证
+
+```bash
+# 非流式与 SSE 并发压测，报告写入 reports/
+python scripts/benchmark_agent.py
+
+# Agent 容器启动、模型冷请求和暖请求对比
+python scripts/cold_start_test.py --container kb-langgraph-agent
+
+# PostgreSQL + Qdrant 备份恢复演练
+python scripts/backup_restore_drill.py \
+  --postgres-container kb-postgres \
+  --qdrant-restore-url http://127.0.0.1:16333
+```
+
+Qdrant 生产存储必须使用 Docker named volume 或 Linux/WSL2 的 POSIX 文件系统。
+不要把 Windows 主机目录直接绑定到 `/qdrant/storage`；该模式可能损坏 RocksDB
+快照及向量数据。默认的 `logical` 策略会导出全部 point、vector、payload 和 payload
+index，并在隔离实例中逐点校验 SHA-256。`snapshot` 策略仅应在受支持的文件系统上使用。
+
+所有报告和备份写入 `reports/`，恢复演练只创建带
+`langgraph_restore_drill_` / `enterprise_kb_restore_drill_` 前缀的临时目标，
+校验完成后自动删除。
 
 ## API Endpoints / API 接口
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | 服务信息 / Service info |
-| GET | `/health` | 健康检查（Qdrant + Ollama） |
+| GET | `/health/live` | 存活检查 / Liveness check |
+| GET | `/health` | 依赖服务健康检查 / Dependency readiness |
+| GET | `/api/v1/health` | 依赖服务健康检查 / Dependency readiness |
 | POST | `/api/v1/agent/ask` | 同步问答 |
 | POST | `/api/v1/agent/stream` | SSE 流式输出 |
 | POST | `/chat/completions` | OpenAI 兼容接口 |
+| POST | `/v1/chat/completions` | OpenAI 兼容接口 |
 
 ## Project Structure / 项目结构
 
@@ -198,7 +236,7 @@ def my_tool(param: str) -> str:
 AGENT_TOOLS = [..., my_tool]
 ```
 
-`AGENT_TOOLS` 列表中的工具会自动注册给 create_react_agent。
+`AGENT_TOOLS` 列表中的工具会自动注册给 create_agent。
 
 ## Checkpointing / 持久化检查点
 

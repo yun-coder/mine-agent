@@ -18,14 +18,17 @@ from __future__ import annotations
 import hmac
 import os
 from fastapi import Header, HTTPException, status
+from src.config import settings
 
 # API Key 从环境变量读取 / Read API key from environment variable
 # 每次请求时动态读取，支持测试时修改 / Read dynamically per request for testability
 def _get_api_key():
-    return os.environ.get("API_KEY", "").strip()
+    return os.environ.get("API_KEY", settings.api_key).strip()
 
 def _is_auth_enabled():
-    return bool(_get_api_key())
+    return os.environ.get(
+        "API_AUTH_DISABLED", str(settings.api_auth_disabled)
+    ).strip().lower() not in {"1", "true", "yes", "on"}
 
 # HTTP Header 名称 / HTTP Header name
 API_KEY_HEADER = "Authorization"
@@ -37,6 +40,11 @@ async def api_key_auth(authorization: str = Header(default=None, alias="Authoriz
         return None
 
     api_key = _get_api_key()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API authentication is not configured",
+        )
 
     if not authorization:
         raise HTTPException(

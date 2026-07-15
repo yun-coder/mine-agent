@@ -24,7 +24,11 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from src.config import settings
-from src.agent.toolkit.sanitizer import terminal_sanitizer
+from src.agent.toolkit.sanitizer import (
+    is_sensitive_path,
+    resolve_allowed_path,
+    terminal_sanitizer,
+)
 from src.api.circuit_breaker import get_ollama_circuit
 from src.metrics import RAG_AVG_SCORE, RAG_EMPTY_RESULTS
 
@@ -258,7 +262,12 @@ def rag_query(query: str, top_k: int = 10, rewrite_query: bool = False) -> str:
 
 
 def _exec_code_search(pattern: str, root_dir: str = None, max_results: int = 20) -> str:
-    root = Path(root_dir) if root_dir else settings.project_root
+    root = resolve_allowed_path(
+        root_dir or str(settings.project_root),
+        expect_dir=True,
+    )
+    if root is None:
+        return "Search root is outside the configured read-only directories."
     matches: list[dict] = []
     for ext in (".py", ".js", ".ts", ".go", ".rs", ".java", ".cpp", ".c", ".h"):
         for f in root.rglob(f"*{ext}"):
@@ -298,7 +307,11 @@ def code_search(pattern: str, root_dir: str = None, max_results: int = 20) -> st
 
 
 def _exec_code_read(path: str, max_lines: int = 200) -> str:
-    fp = Path(path)
+    fp = resolve_allowed_path(path, expect_dir=False)
+    if fp is None:
+        return f"Path is outside the configured read-only directories: {path}"
+    if is_sensitive_path(fp):
+        return "Access to credential or secret files is not allowed."
     if not fp.exists():
         return f"文件不存在 / File not found: {path}"
     size = fp.stat().st_size
@@ -348,7 +361,9 @@ def _walk_tree(parent: Path, lines: list[str], current_depth: int, max_depth: in
 
 
 def _exec_file_tree(directory: str, depth: int = 2) -> str:
-    dp = Path(directory)
+    dp = resolve_allowed_path(directory, expect_dir=True)
+    if dp is None:
+        return "Directory is outside the configured read-only directories."
     if not dp.is_dir():
         return f"目录不存在 / Directory not found: {directory}"
     lines: list[str] = [str(dp)]
@@ -379,6 +394,7 @@ def _exec_terminal(command: str, timeout: int = 30) -> str:
         return f"已拦截 / BLOCKED: {result['reason']}"
 
     safe_cmd = result["command"]
+    timeout = max(1, min(int(timeout), 30))
 
     # 判断操作系统 / Determine OS
     is_windows = os.name == "nt" or "windir" in os.environ
@@ -522,14 +538,15 @@ def get_current_time() -> str:
 # 工具注册表 / Registry
 # ------------------------------------------------------------------
 
-# BaseTool 实例列表 — 供 create_react_agent + ToolNode 使用
+# BaseTool 实例列表 — 供 create_agent + ToolNode 使用
 AGENT_TOOLS: list[Any] = [
     rag_query,
     code_search,
     code_read,
     file_tree,
-    terminal_execute,
     system_info,
     calculate,
     get_current_time,
 ]
+if settings.terminal_enabled:
+    AGENT_TOOLS.insert(4, terminal_execute)

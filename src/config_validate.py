@@ -47,7 +47,7 @@ def validate_dependencies(required: bool = True) -> dict[str, bool]:
         with httpx.Client(timeout=5) as c:
             r = c.post(
                 f"{settings.ollama_base_url}/api/embeddings",
-                json={"model": "bge-m3", "prompt": "health check"},
+                json={"model": settings.embed_model, "prompt": "health check"},
             )
             results["ollama_embed"] = r.status_code == 200
             if results["ollama_embed"]:
@@ -90,7 +90,8 @@ def validate_dependencies(required: bool = True) -> dict[str, bool]:
     if settings.pg_dsn:
         try:
             import psycopg2
-            conn = psycopg2.connect(settings.pg_dsn, connect_timeout=5)
+            dsn = settings.pg_dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+            conn = psycopg2.connect(dsn, connect_timeout=5)
             conn.close()
             results["postgres"] = True
             logger.info("[配置 / Config] PostgreSQL: 已连接 / connected")
@@ -99,7 +100,7 @@ def validate_dependencies(required: bool = True) -> dict[str, bool]:
             results["postgres"] = False
     else:
         logger.info("[配置 / Config] PostgreSQL: 未配置，使用内存检查点 / not configured, using memory checkpointer")
-        results["postgres"] = True
+        results["postgres"] = not settings.checkpoint_required
 
     # 总结 / Summary
     failed = [k for k, v in results.items() if not v]

@@ -15,8 +15,11 @@ Architecture change 2026-07-09:
 from __future__ import annotations
 
 import base64
+import asyncio
 import re
+import threading
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -42,11 +45,12 @@ except ImportError:
 TRACELOOP_TRACE_CONTENT = "TRACELOOP_TRACE_CONTENT"
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain.agents import create_agent
+from langchain.agents.middleware import wrap_model_call
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import create_react_agent
 from loguru import logger
 
 from src.config import settings
@@ -155,34 +159,38 @@ SYSTEM_PROMPT = (
 _REACT_AGENT_CACHE: CompiledStateGraph | None = None
 
 
+class AgentExecutionError(RuntimeError):
+    """Raised when the model/tool execution path cannot produce an answer."""
+
+
+@wrap_model_call
+def _trim_agent_history(request, handler):
+    """Limit model context without mutating the persisted conversation state."""
+    max_history = 20
+    messages = request.messages
+    if len(messages) > max_history:
+        request = request.override(messages=messages[-max_history:])
+    return handler(request)
+
+
 def _build_react_agent() -> CompiledStateGraph:
     """懒编译 ReACT agent 子图。"""
     global _REACT_AGENT_CACHE
     if _REACT_AGENT_CACHE is not None:
         return _REACT_AGENT_CACHE
 
-    from langgraph.runtime import Runtime
+    llm = ChatOllama(
+        model=settings.llm_model,
+        base_url=settings.ollama_base_url,
+        temperature=0.1,
+        num_ctx=8192,
+    )
 
-    def model_fn(state: dict, runtime: Runtime) -> ChatOllama:
-        llm = ChatOllama(
-            model=settings.llm_model,
-            base_url=settings.ollama_base_url,
-            temperature=0.1,
-            num_ctx=8192,
-        )
-        return llm.bind_tools(AGENT_TOOLS)
-
-    def prompt_fn(state: dict) -> list:
-        messages = list(state.get("messages", []))
-        max_history = 20
-        if len(messages) > max_history:
-            messages = messages[-max_history:]
-        return [SystemMessage(content=SYSTEM_PROMPT)] + messages
-
-    _REACT_AGENT_CACHE = create_react_agent(
-        model=model_fn,
+    _REACT_AGENT_CACHE = create_agent(
+        model=llm,
         tools=AGENT_TOOLS,
-        prompt=prompt_fn,
+        system_prompt=SYSTEM_PROMPT,
+        middleware=[_trim_agent_history],
         checkpointer=None,
         name="react_agent",
     )
@@ -207,9 +215,11 @@ def agent_orchestrator(state: AgentState) -> AgentState:
         return state
 
     result = None
+    execution_error: Exception | None = None
     try:
         result = react_agent.invoke(react_input)
     except Exception as exc:
+        execution_error = exc
         # 对可恢复异常尝试重试 / Retry once for recoverable errors
         _RETRYABLE = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError)
         if isinstance(exc, _RETRYABLE) and settings.max_agent_retries > 0:
@@ -219,18 +229,16 @@ def agent_orchestrator(state: AgentState) -> AgentState:
                 result = react_agent.invoke(react_input)
             except Exception as exc2:
                 logger.error(f"[Orchestrator] 重试仍然失败: {exc2}")
+                execution_error = exc2
                 result = None
 
         if result is None:
-            logger.error(f"[Orchestrator] ReACT agent 调用失败: {exc}")
-            fallback_msg = AIMessage(
-                content="工具调用过程中发生错误，请稍后重试。/ An error occurred during tool execution. Please try again."
+            logger.error(
+                f"[Orchestrator] ReACT agent 调用失败: {execution_error}"
             )
-            messages = list(state.get("messages", []))
-            messages.append(fallback_msg)
-            state["messages"] = messages
-            state["final_answer"] = fallback_msg.content
-            return state
+            raise AgentExecutionError(
+                "Agent model/tool execution failed"
+            ) from execution_error
 
     messages = result.get("messages", [])
     final_answer = ""
@@ -241,6 +249,7 @@ def agent_orchestrator(state: AgentState) -> AgentState:
 
     state["messages"] = messages
     state["final_answer"] = final_answer
+    state["iteration_count"] = iteration_count + 1
     state["tool_log"] = state.get("tool_log", []) + [
         {"step": "orchestrator", "direct_answer": bool(final_answer)}
     ]
@@ -272,22 +281,116 @@ def format_response(state: AgentState) -> AgentState:
 # ======================================================================
 
 
-def _build_checkpointer():
-    """根据配置构建检查点保存器。"""
-    if settings.pg_dsn:
-        try:
-            from langgraph.checkpoint.postgres import PostgresSaver
-            return PostgresSaver.from_conn_string(settings.pg_dsn)
-        except ImportError:
-            logger.warning("[Graph] langgraph-checkpoint-postgres 未安装（pip install langgraph-checkpoint-postgres），回退到 MemorySaver")
-        except Exception as exc:
-            logger.warning(f"[Graph] Postgres checkpointer 初始化失败 ({exc})，回退到 MemorySaver")
+_CHECKPOINTER = None
+_CHECKPOINTER_CONTEXT = None
+_CHECKPOINTER_LOCK = threading.Lock()
+_COMPILED_GRAPH_CACHE: dict[bool, CompiledStateGraph] = {}
+_ASYNC_CHECKPOINTER = None
+_ASYNC_CHECKPOINTER_CONTEXT = None
+_ASYNC_CHECKPOINTER_LOCK = asyncio.Lock()
+_ASYNC_COMPILED_GRAPH_CACHE: dict[bool, CompiledStateGraph] = {}
 
-    try:
-        return MemorySaver()
-    except Exception as exc:
-        logger.warning(f"[Graph] MemorySaver 不可用: {exc}")
-        return None
+
+def _normalized_pg_dsn(dsn: str) -> str:
+    return dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+def _build_checkpointer():
+    """Build one process-wide checkpointer and keep its DB context alive."""
+    global _CHECKPOINTER, _CHECKPOINTER_CONTEXT
+    if _CHECKPOINTER is not None:
+        return _CHECKPOINTER
+
+    with _CHECKPOINTER_LOCK:
+        if _CHECKPOINTER is not None:
+            return _CHECKPOINTER
+        if settings.pg_dsn:
+            try:
+                from langgraph.checkpoint.postgres import PostgresSaver
+
+                context = PostgresSaver.from_conn_string(
+                    _normalized_pg_dsn(settings.pg_dsn)
+                )
+                saver = context.__enter__()
+                saver.setup()
+                _CHECKPOINTER_CONTEXT = context
+                _CHECKPOINTER = saver
+                logger.info("[Graph] PostgreSQL checkpointer enabled")
+                return saver
+            except Exception as exc:
+                if _CHECKPOINTER_CONTEXT is not None:
+                    _CHECKPOINTER_CONTEXT.__exit__(type(exc), exc, exc.__traceback__)
+                    _CHECKPOINTER_CONTEXT = None
+                message = f"PostgreSQL checkpointer initialization failed: {exc}"
+                if settings.checkpoint_required:
+                    raise RuntimeError(message) from exc
+                logger.warning(f"[Graph] {message}; using MemorySaver")
+
+        if settings.checkpoint_required:
+            raise RuntimeError("Checkpointing is required but PG_DSN is not configured")
+        _CHECKPOINTER = MemorySaver()
+        logger.warning("[Graph] Using in-memory checkpointer; state is not durable")
+        return _CHECKPOINTER
+
+
+def close_checkpointer() -> None:
+    global _CHECKPOINTER, _CHECKPOINTER_CONTEXT
+    with _CHECKPOINTER_LOCK:
+        if _CHECKPOINTER_CONTEXT is not None:
+            _CHECKPOINTER_CONTEXT.__exit__(None, None, None)
+        _CHECKPOINTER_CONTEXT = None
+        _CHECKPOINTER = None
+        _COMPILED_GRAPH_CACHE.clear()
+        _ASYNC_COMPILED_GRAPH_CACHE.clear()
+
+
+async def _build_async_checkpointer():
+    """Build an async checkpointer for LangGraph streaming execution."""
+    global _ASYNC_CHECKPOINTER, _ASYNC_CHECKPOINTER_CONTEXT
+    if _ASYNC_CHECKPOINTER is not None:
+        return _ASYNC_CHECKPOINTER
+
+    async with _ASYNC_CHECKPOINTER_LOCK:
+        if _ASYNC_CHECKPOINTER is not None:
+            return _ASYNC_CHECKPOINTER
+        if settings.pg_dsn:
+            context = None
+            try:
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+                context = AsyncPostgresSaver.from_conn_string(
+                    _normalized_pg_dsn(settings.pg_dsn)
+                )
+                saver = await context.__aenter__()
+                await saver.setup()
+                _ASYNC_CHECKPOINTER_CONTEXT = context
+                _ASYNC_CHECKPOINTER = saver
+                logger.info("[Graph] Async PostgreSQL checkpointer enabled")
+                return saver
+            except Exception as exc:
+                if context is not None:
+                    await context.__aexit__(type(exc), exc, exc.__traceback__)
+                message = f"Async PostgreSQL checkpointer initialization failed: {exc}"
+                if settings.checkpoint_required:
+                    raise RuntimeError(message) from exc
+                logger.warning(f"[Graph] {message}; using async in-memory checkpointer")
+
+        if settings.checkpoint_required:
+            raise RuntimeError("Checkpointing is required but PG_DSN is not configured")
+        _ASYNC_CHECKPOINTER = MemorySaver()
+        logger.warning("[Graph] Using async in-memory checkpointer; state is not durable")
+        return _ASYNC_CHECKPOINTER
+
+
+async def get_compiled_graph_async(checkpoint: bool = True):
+    """Return a graph compiled with a checkpointer compatible with async streaming."""
+    if checkpoint in _ASYNC_COMPILED_GRAPH_CACHE:
+        return _ASYNC_COMPILED_GRAPH_CACHE[checkpoint]
+    graph_builder = build_graph(checkpoint=checkpoint)
+    checkpointer = await _build_async_checkpointer() if checkpoint else False
+    compiled = graph_builder.compile(checkpointer=checkpointer)
+    _ASYNC_COMPILED_GRAPH_CACHE[checkpoint] = compiled
+    return compiled
 
 
 def build_graph(checkpoint: bool = True) -> StateGraph:
@@ -301,20 +404,17 @@ def build_graph(checkpoint: bool = True) -> StateGraph:
     builder.add_edge("agent_orchestrator", "format_response")
     builder.add_edge("format_response", END)
 
-    if checkpoint:
-        cp = _build_checkpointer()
-        if cp:
-            builder.checkpointer = cp
-        else:
-            logger.warning("[Graph] 无检查点可用，无检查点运行")
-
     return builder
 
 
 def get_compiled_graph(checkpoint: bool = True):
-    """返回编译好的 LangGraph 图实例。"""
+    if checkpoint in _COMPILED_GRAPH_CACHE:
+        return _COMPILED_GRAPH_CACHE[checkpoint]
     graph_builder = build_graph(checkpoint=checkpoint)
-    return graph_builder.compile()
+    checkpointer = _build_checkpointer() if checkpoint else False
+    compiled = graph_builder.compile(checkpointer=checkpointer)
+    _COMPILED_GRAPH_CACHE[checkpoint] = compiled
+    return compiled
 
 
 # ======================================================================
@@ -332,7 +432,7 @@ def run_agent(
     graph = get_compiled_graph(checkpoint=checkpoint)
 
     initial_state: AgentState = {
-        "messages": messages if messages else [HumanMessage(content=question)],
+        "messages": list(messages) if messages else [HumanMessage(content=question)],
         "query": question,
         "session_id": session_id,
         "final_answer": "",
@@ -371,10 +471,15 @@ def run_agent(
     # 调用图（Langfuse OTel 自动捕获内部 span）
     # ================================================================
     tracer = trace.get_tracer("langgraph-agent")
+    thread_id = session_id.strip() or f"request-{uuid.uuid4().hex}"
+    run_config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": max(10, _MAX_ITERATIONS * 4),
+    }
     with tracer.start_as_current_span("run_agent") as span:
         span.set_attribute("input", question)
         span.set_attribute("session_id", session_id)
-        result = graph.invoke(initial_state)
+        result = graph.invoke(initial_state, config=run_config)
         span.set_attribute("output", result.get("final_answer", ""))
         span.set_attribute("answer_length", len(result.get("final_answer", "")))
 
@@ -398,4 +503,5 @@ def run_agent(
         "answer": final_answer,
         "tool_log": result.get("tool_log", []),
         "iteration_count": result.get("iteration_count", 0),
+        "session_id": thread_id,
     }

@@ -25,7 +25,7 @@ def cmd_ask(args):
     result = run_agent(
         question=args.question,
         session_id=args.session or "",
-        checkpoint=False,
+        checkpoint=settings.checkpoint_enabled,
     )
     print(f"\n{'='*60}")
     print(f"回答:\n{result.get('final_answer', result.get('answer', ''))}")
@@ -41,9 +41,14 @@ def cmd_stream(args):
 
     async def main():
         async with httpx.AsyncClient(timeout=300) as client:
+            headers = {}
+            api_key = settings.api_key.strip()
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
             resp = await client.post(
                 "http://127.0.0.1:8000/api/v1/agent/stream",
                 json={"question": args.question, "session_id": args.session or ""},
+                headers=headers,
             )
             resp.raise_for_status()
             async for line in resp.aiter_lines():
