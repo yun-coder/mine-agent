@@ -22,8 +22,9 @@ class Settings(BaseSettings):
 
     # 智能体调优参数 / Agent tuning
     max_iterations: int = 5
+    max_agent_retries: int = 1        # 智能体重试次数 / Agent retry count
     top_k_rag: int = 10
-    stream_chunk_size: int = 4
+    stream_chunk_size: int = 50
 
     # 嵌入模型 / Embedding model
     embed_model: str = "bge-m3"          # Ollama 嵌入模型名称
@@ -33,9 +34,11 @@ class Settings(BaseSettings):
     rag_use_hybrid_search: bool = True   # 开启向量+BM25+RRF混合检索
     rag_use_reranker: bool = False       # 开启BGE Reranker重排序
     rag_use_query_rewrite: bool = False  # 开启LLM查询改写
+    rag_rewrite_model: str = ""          # 查询改写使用的模型(空=与主模型一致)
     rag_rerank_top_k: int = 5            # 重排序后保留的结果数
     rag_rrf_k: int = 60                  # RRF融合参数
     rag_bm25_path: str = ""              # BM25索引缓存路径(空=自动)
+    rag_rewrite_timeout: float = 10.0    # 查询改写超时(秒)
 
     # Langfuse 配置 / Langfuse
     langfuse_public_key: str = ""

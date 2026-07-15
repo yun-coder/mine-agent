@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import hmac
 import os
 from fastapi import Header, HTTPException, status
 
@@ -48,7 +49,7 @@ async def api_key_auth(authorization: str = Header(default=None, alias="Authoriz
     if key.startswith("Bearer "):
         key = key[7:]
 
-    if key != api_key:
+    if not hmac.compare_digest(key, api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效的 API Key / Invalid API key",

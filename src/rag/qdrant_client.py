@@ -35,6 +35,13 @@ from rank_bm25 import BM25Okapi
 
 from src.config import settings
 from src.api.retry import retry
+from src.api.circuit_breaker import get_ollama_circuit
+
+try:
+    from src.metrics import EMBED_CACHE_HITS, EMBED_CACHE_MISSES
+    _HAS_METRICS = True
+except ImportError:
+    _HAS_METRICS = False
 
 
 # ======================================================================
@@ -80,9 +87,13 @@ class _EmbedCache:
         if h in self._cache:
             ts, vec = self._cache[h]
             if time.time() - ts < self._ttl:
+                if _HAS_METRICS:
+                    EMBED_CACHE_HITS.inc()
                 return vec
             else:
                 del self._cache[h]  # 过期 / Expired
+        if _HAS_METRICS:
+            EMBED_CACHE_MISSES.inc()
         return None
 
     def put(self, text: str, vector: list[float]) -> None:
@@ -173,13 +184,28 @@ class OllamaEmbedder:
 
     def _call_ollama(self, texts: list[str]) -> list[list[float]]:
         """实际调用 Ollama API / Actually call Ollama API."""
+        # 熔断器检查 / Circuit breaker check
+        cb = get_ollama_circuit()
+        if not cb.can_execute():
+            logger.warning("[Embedder] Ollama 熔断器已开启，返回空向量 / Circuit open, returning empty vectors")
+            return [0.0] * self.DIM
+
         if self._use_batch:
             try:
-                return self._embed_batch(texts)
+                result = self._embed_batch(texts)
+                cb.record_success()
+                return result
             except Exception as exc:
                 logger.warning(f"[嵌入器 / Embedder] 批量失败 ({exc})，回退到逐条请求 / batch failed, falling back to per-request")
                 self._use_batch = False
-        return self._embed_per_request(texts)
+
+        try:
+            result = self._embed_per_request(texts)
+            cb.record_success()
+            return result
+        except Exception as exc:
+            cb.record_failure()
+            raise
 
     @retry(max_retries=2, base_delay=1.0, max_delay=5.0, retryable_exceptions=(httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadTimeout))
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:

@@ -50,6 +50,21 @@ ERROR_COUNT = Counter(
     ["type"],
 )
 
+# ------------------------------------------------------------------
+# RAG 质量指标 / RAG quality metrics
+# ------------------------------------------------------------------
+
+RAG_AVG_SCORE = Histogram(
+    "rag_result_avg_score",
+    "RAG result average score distribution",
+    buckets=(0.1, 0.3, 0.5, 0.7, 0.9),
+)
+
+RAG_EMPTY_RESULTS = Counter(
+    "rag_empty_results_total",
+    "Total RAG queries with zero results",
+)
+
 
 def init_metrics(app: FastAPI) -> None:
     """注册指标中间件和端点 / Register metrics middleware and endpoint."""

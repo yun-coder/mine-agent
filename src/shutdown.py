@@ -28,6 +28,14 @@ def setup_graceful_shutdown():
         except Exception as exc:
             logger.warning(f"[Shutdown] 关闭嵌入客户端失败: {exc}")
 
+        # 关闭 LLM 辅助客户端 / Close LLM helper client
+        try:
+            from src.agent.tools import close_llm_client
+            close_llm_client()
+            logger.info("[Shutdown] LLM 客户端已关闭 / LLM client closed")
+        except Exception as exc:
+            logger.warning(f"[Shutdown] 关闭 LLM 客户端失败: {exc}")
+
         logger.info("[Shutdown] 关闭完成 / Shutdown complete")
         sys.exit(0)
 

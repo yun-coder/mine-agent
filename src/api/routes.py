@@ -9,6 +9,7 @@ from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage
 from opentelemetry import trace
 from pydantic import BaseModel, Field, field_validator
 
@@ -16,7 +17,8 @@ from src.agent.graph import run_agent, get_compiled_graph, AgentState
 from src.config import settings
 from src.api.auth import api_key_auth
 from src.api.rate_limit import check_rate_limit
-from langchain_core.messages import HumanMessage
+from src.tdai_client import get_client
+from loguru import logger
 
 router = APIRouter(prefix="/api/v1")
 
@@ -202,13 +204,41 @@ async def agent_stream(req: QuestionRequest, request: Request):
     async def event_generator() -> AsyncGenerator[str, None]:
         t0 = time.time()
 
+        # TDAI 记忆召回（与同步 run_agent 一致）/ TDAI memory recall
+        tdai = get_client()
+        tool_log: list[dict] = []
+        messages_base = [HumanMessage(content=req.question)]
+
+        if tdai.enabled:
+            try:
+                memory_result = tdai.sync_recall(
+                    query=req.question,
+                    session_key=req.session_id or "default",
+                )
+                system_ctx = memory_result.get("appendSystemContext", "")
+                if system_ctx:
+                    memory_msg = SystemMessage(
+                        content=(
+                            "以下是与用户相关的历史记忆，请参考这些信息回答：\n\n"
+                            f"{system_ctx}"
+                        )
+                    )
+                    messages_base.insert(0, memory_msg)
+                    tool_log.append({
+                        "step": "tdai_recall",
+                        "memory_count": memory_result.get("memory_count", 0),
+                    })
+                    logger.info(f"[TDAI] 流式注入 {memory_result.get('memory_count', 0)} 条历史记忆")
+            except Exception as exc:
+                logger.warning(f"[TDAI] 流式召回失败（不影响主流程）: {exc}")
+
         # 构建初始状态
         initial: AgentState = {
-            "messages": [HumanMessage(content=req.question)],
+            "messages": messages_base,
             "query": req.question,
             "session_id": req.session_id,
             "final_answer": "",
-            "tool_log": [],
+            "tool_log": list(tool_log),
             "iteration_count": 0,
         }
 
@@ -217,7 +247,6 @@ async def agent_stream(req: QuestionRequest, request: Request):
 
         final_answer = ""
         chunks_buffer: list[str] = []
-        tool_log: list[dict] = []
 
         try:
             # langgraph 1.2.9+ 的 astream_events 返回 dict，不是 tuple
@@ -238,10 +267,12 @@ async def agent_stream(req: QuestionRequest, request: Request):
 
                 elif event_type == "on_tool_start":
                     tool_name = event.get("name", "unknown")
+                    tool_log.append({"step": "tool_start", "tool": tool_name})
                     yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name}, ensure_ascii=False)}\n\n"
 
                 elif event_type == "on_tool_end":
                     tool_name = event.get("name", "")
+                    tool_log.append({"step": "tool_end", "tool": tool_name})
                     yield f"data: {json.dumps({'type': 'tool_end', 'tool': tool_name}, ensure_ascii=False)}\n\n"
 
                 elif event_type == "on_chain_end":
@@ -259,6 +290,19 @@ async def agent_stream(req: QuestionRequest, request: Request):
         # 如果流式事件没有捕获到 final_answer，从累积的 chunk 拼接
         if not final_answer and chunks_buffer:
             final_answer = "".join(chunks_buffer).strip()
+
+        # TDAI 记忆保存（与同步 run_agent 一致）/ TDAI memory capture
+        if tdai.enabled and final_answer:
+            try:
+                tdai.sync_capture(
+                    user_content=req.question,
+                    assistant_content=final_answer,
+                    session_key=req.session_id or "default",
+                    session_id=req.session_id,
+                )
+                logger.debug("[TDAI] 对话已保存到记忆系统 / Conversation captured to memory")
+            except Exception as exc:
+                logger.debug(f"[TDAI] 保存失败（不影响主流程）/ Capture failed (non-fatal): {exc}")
 
         if final_answer:
             chunk_size = settings.stream_chunk_size
@@ -340,9 +384,29 @@ async def _openai_chat_completions_stream(
     """OpenAI 兼容的流式 SSE 响应 — 供 OpenWebUI 使用。"""
 
     async def event_generator() -> AsyncGenerator[str, None]:
+        # TDAI 记忆召回 / TDAI memory recall
+        tdai = get_client()
+        user_query = lc_messages[-1].content if lc_messages else ""
+        messages_base = list(lc_messages)
+        if tdai.enabled:
+            try:
+                memory_result = tdai.sync_recall(query=user_query, session_key="default")
+                system_ctx = memory_result.get("appendSystemContext", "")
+                if system_ctx:
+                    memory_msg = SystemMessage(
+                        content=(
+                            "以下是与用户相关的历史记忆，请参考这些信息回答：\n\n"
+                            f"{system_ctx}"
+                        )
+                    )
+                    messages_base.insert(0, memory_msg)
+                    logger.info(f"[TDAI] OpenAI 流式注入 {memory_result.get('memory_count', 0)} 条历史记忆")
+            except Exception as exc:
+                logger.warning(f"[TDAI] OpenAI 流式召回失败（不影响主流程）: {exc}")
+
         initial: AgentState = {
-            "messages": lc_messages,
-            "query": lc_messages[-1].content if lc_messages else "",
+            "messages": messages_base,
+            "query": user_query,
             "session_id": "",
             "final_answer": "",
             "tool_log": [],
@@ -388,6 +452,18 @@ async def _openai_chat_completions_stream(
 
         if not full_answer and chunks_buffer:
             full_answer = "".join(chunks_buffer).strip()
+
+        # TDAI 记忆保存 / TDAI memory capture
+        if tdai.enabled and full_answer:
+            try:
+                tdai.sync_capture(
+                    user_content=user_query,
+                    assistant_content=full_answer,
+                    session_key="default",
+                )
+                logger.debug("[TDAI] OpenAI 流式对话已保存到记忆系统")
+            except Exception as exc:
+                logger.debug(f"[TDAI] OpenAI 流式保存失败（不影响主流程）: {exc}")
 
         if full_answer:
             chunk_size = settings.stream_chunk_size

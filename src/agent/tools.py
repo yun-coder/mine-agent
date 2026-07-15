@@ -25,32 +25,84 @@ from loguru import logger
 
 from src.config import settings
 from src.agent.toolkit.sanitizer import terminal_sanitizer
+from src.api.circuit_breaker import get_ollama_circuit
+from src.metrics import RAG_AVG_SCORE, RAG_EMPTY_RESULTS
+
+# ------------------------------------------------------------------
+# httpx 连接池单例 / httpx connection pool singleton
+# ------------------------------------------------------------------
+
+_llm_client: httpx.Client | None = None
+
+
+def _get_llm_client() -> httpx.Client:
+    """获取共享的 httpx Client（连接池）/ Get shared httpx Client (connection pool)."""
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = httpx.Client(
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _llm_client
+
+
+def close_llm_client() -> None:
+    """关闭 LLM 辅助客户端（优雅关闭时使用）/ Close LLM helper client (used on graceful shutdown)."""
+    global _llm_client
+    if _llm_client is not None:
+        _llm_client.close()
+        _llm_client = None
+
 
 # ------------------------------------------------------------------
 # RAG 工具 / RAG tool
 # ------------------------------------------------------------------
 
 
-def _call_llm(prompt: str, temperature: float = 0.3, max_tokens: int = 300) -> str:
-    """调用 Ollama 生成辅助说明（非工具调用）。"""
+def _call_llm(
+    prompt: str,
+    temperature: float = 0.3,
+    max_tokens: int = 300,
+    model: str | None = None,
+    timeout: float = 30.0,
+) -> str:
+    """调用 Ollama 生成辅助说明（非工具调用）。
+
+    Args:
+        prompt: 提示词
+        temperature: 生成温度
+        max_tokens: 最大生成 token 数
+        model: 使用的模型（默认 settings.llm_model）
+        timeout: 请求超时(秒)
+    """
+    # 熔断器检查 / Circuit breaker check
+    cb = get_ollama_circuit()
+    if not cb.can_execute():
+        logger.warning("[CircuitBreaker] Ollama 熔断器已开启，跳过 LLM 调用 / Circuit open, skipping LLM call")
+        return ""
+
+    client = _get_llm_client()
+    model_name = model or settings.llm_model
     try:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(
-                f"{settings.ollama_base_url}/api/generate",
-                json={
-                    "model": settings.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": temperature,
-                        "num_predict": max_tokens,
-                    },
+        r = client.post(
+            f"{settings.ollama_base_url}/api/generate",
+            json={
+                "model": model_name,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": max_tokens,
                 },
-            )
-            r.raise_for_status()
-            return r.json()["response"].strip()
+            },
+            timeout=httpx.Timeout(timeout),
+        )
+        r.raise_for_status()
+        cb.record_success()
+        return r.json()["response"].strip()
     except Exception as exc:
         logger.debug(f"[RAG] LLM 辅助调用失败 / LLM helper call failed: {exc}")
+        cb.record_failure()
         return ""
 
 
@@ -65,7 +117,14 @@ def _rewrite_query(query: str, num_queries: int = 3) -> list[str]:
         f"原问题: {query}\n\n"
         '输出格式示例: ["查询1", "查询2", "查询3"]'
     )
-    response = _call_llm(prompt, temperature=0.3, max_tokens=300)
+    rewrite_model = settings.rag_rewrite_model or settings.llm_model
+    response = _call_llm(
+        prompt,
+        temperature=0.3,
+        max_tokens=300,
+        model=rewrite_model,
+        timeout=settings.rag_rewrite_timeout,
+    )
     if not response:
         return [query]
 
@@ -98,10 +157,13 @@ def _rewrite_query(query: str, num_queries: int = 3) -> list[str]:
 def _check_result_quality(query: str, results: list[dict]) -> tuple[bool, str | None]:
     """检查检索结果质量。如果结果不足，返回 (False, rewritten_query)；否则返回 (True, None)。"""
     if not results:
+        RAG_EMPTY_RESULTS.inc()
         return False, query  # 无结果，重试
 
     # 简单启发式：分数过低说明不相关
     avg_score = sum(r.get("score", 0) for r in results) / len(results)
+    RAG_AVG_SCORE.observe(avg_score)
+
     if avg_score < 0.3:
         # 尝试用关键词风格改写查询再搜
         rewritten = _rewrite_query(query, num_queries=2)

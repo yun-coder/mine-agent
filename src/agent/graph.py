@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import base64
 import re
+import time
 from typing import Any
 
+import httpx
 from opentelemetry import trace
 
 # Optional: Langfuse / OTel auto-instrumentation
@@ -204,18 +206,31 @@ def agent_orchestrator(state: AgentState) -> AgentState:
         state["final_answer"] = answer_msg.content
         return state
 
+    result = None
     try:
         result = react_agent.invoke(react_input)
     except Exception as exc:
-        logger.error(f"[Orchestrator] ReACT agent 调用失败: {exc}")
-        fallback_msg = AIMessage(
-            content="工具调用过程中发生错误，请稍后重试。/ An error occurred during tool execution. Please try again."
-        )
-        messages = list(state.get("messages", []))
-        messages.append(fallback_msg)
-        state["messages"] = messages
-        state["final_answer"] = fallback_msg.content
-        return state
+        # 对可恢复异常尝试重试 / Retry once for recoverable errors
+        _RETRYABLE = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError)
+        if isinstance(exc, _RETRYABLE) and settings.max_agent_retries > 0:
+            logger.warning(f"[Orchestrator] ReACT agent 调用失败，{settings.max_agent_retries} 次重试后重试: {exc}")
+            time.sleep(1.0)
+            try:
+                result = react_agent.invoke(react_input)
+            except Exception as exc2:
+                logger.error(f"[Orchestrator] 重试仍然失败: {exc2}")
+                result = None
+
+        if result is None:
+            logger.error(f"[Orchestrator] ReACT agent 调用失败: {exc}")
+            fallback_msg = AIMessage(
+                content="工具调用过程中发生错误，请稍后重试。/ An error occurred during tool execution. Please try again."
+            )
+            messages = list(state.get("messages", []))
+            messages.append(fallback_msg)
+            state["messages"] = messages
+            state["final_answer"] = fallback_msg.content
+            return state
 
     messages = result.get("messages", [])
     final_answer = ""
@@ -264,7 +279,7 @@ def _build_checkpointer():
             from langgraph.checkpoint.postgres import PostgresSaver
             return PostgresSaver.from_conn_string(settings.pg_dsn)
         except ImportError:
-            logger.warning("[Graph] langgraph-checkpoint-postgres 不可用，回退到 MemorySaver")
+            logger.warning("[Graph] langgraph-checkpoint-postgres 未安装（pip install langgraph-checkpoint-postgres），回退到 MemorySaver")
         except Exception as exc:
             logger.warning(f"[Graph] Postgres checkpointer 初始化失败 ({exc})，回退到 MemorySaver")
 
