@@ -1,0 +1,50 @@
+services:
+  agent-platform:
+    build: .
+    image: langgraph-agent:latest
+    container_name: langgraph-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Docker 环境下覆盖 localhost → host.docker.internal
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - QDRANT_HOST=host.docker.internal
+      - LANGFUSE_HOST=http://host.docker.internal:3001
+      # 路径映射（容器内路径）
+      - DOCS_DIR=/data/docs
+      - PROJECT_ROOT=/projects
+    volumes:
+      - D:/data/docs:/data/docs:ro
+      - D:/projects:/projects:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  open-webui:
+    image: openwebui/open-webui:latest
+    container_name: open-webui-agent
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    volumes:
+      - D:/data/open-webui:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - WEBUI_AUTH=false
+      # 指向同 compose 内的 langgraph-agent（Docker 网络直连）
+      - OPENAI_API_BASE_URLS=http://agent-platform:8000
+      - OPENAI_API_KEYS=not-needed
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - agent-platform
+    deploy:
+      resources:
+        limits:
+          memory: 2G
